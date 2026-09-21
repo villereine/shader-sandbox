@@ -1,0 +1,14 @@
+{
+  "name": "shader-sandbox",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite"
+  },
+  "dependencies": {
+    "three": "^0.170.0"
+  },
+  "devDependencies": {
+    "vite": "^6.0.0"
+  }
+}
