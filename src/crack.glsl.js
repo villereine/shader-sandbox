@@ -44,8 +44,14 @@ float voronoiB( vec2 u, out float width, out vec2 site_ ) {
         if( d < m ) m = d, P = r;
     }
     site_ = u + P;
-    width = WIDTH_MIN + (WIDTH_MAX - WIDTH_MIN) * hash21(iu + u - P);
-    float fillet = FILLET_MIN + (FILLET_MAX - FILLET_MIN) * hash21(iu + u - P + 31.4);
+#ifdef MASK_Q   // scatter placement mask (main.js): one fixed width/fillet instead of the per-pixel hash,
+                // so the speckle halo drops out and only a clean crack shape remains
+    float wq = MASK_Q, fq = MASK_Q;
+#else
+    float wq = hash21(iu + u - P), fq = hash21(iu + u - P + 31.4);
+#endif
+    width = WIDTH_MIN + (WIDTH_MAX - WIDTH_MIN) * wq;
+    float fillet = FILLET_MIN + (FILLET_MAX - FILLET_MIN) * fq;
     m = 1e9;
     for( int k=0; k < 49; k++ ) {
         vec2 r = site(iu, u, k);
