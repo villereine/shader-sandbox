@@ -2,3 +2,4 @@ node_modules/
 dist/
 scratch-*.png
 .claude/
+CLAUDE.md
