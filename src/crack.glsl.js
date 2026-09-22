@@ -4,7 +4,8 @@
 export default /* glsl */ `
 uniform vec2 seed;   // offsets the sampled pattern; set from JS to get a different layout
 const float OFS = .2;         // jitter Voronoi centers in -OFS ... 1.+OFS
-const float ZEBRA_AMP = .6;       // fbm warp of the cells; above ~.3 the warp folds and the field breaks
+uniform float zebraAmp;   // fbm warp strength of the cells (GUI "warp amp"); above ~.3 the warp folds
+uniform float noiseFreq;  // fbm warp frequency (GUI "warp noise"); higher = finer wiggles along cracks
 const float FILLET_MIN = .2;       // per-cell random fillet radius range; rounds sharp crack junctions, 0 = hard-min corners
 const float FILLET_MAX = .5;
 const float WIDTH_MIN = 5.;       // per-crack random line half-width range, in pixels (see main.js HALF_PX)
@@ -34,8 +35,7 @@ vec2 site( vec2 iu, vec2 u, int k ) {
 }
 
 // distance to Voronoi borders. width: per-cell random line half-width (WIDTH_MIN..WIDTH_MAX), hashed from the winning site.
-// site_: warped-space position of the winning site, i.e. which cell this point belongs to (for per-cell culling).
-float voronoiB( vec2 u, out float width, out vec2 site_ ) {
+float voronoiB( vec2 u, out float width ) {
     vec2 iu = floor(u), P;
     float m = 1e9;
     for( int k=0; k < 49; k++ ) {
@@ -43,7 +43,6 @@ float voronoiB( vec2 u, out float width, out vec2 site_ ) {
         float d = dot(r,r);
         if( d < m ) m = d, P = r;
     }
-    site_ = u + P;
 #ifdef MASK_Q   // scatter placement mask (main.js): one fixed width/fillet instead of the per-pixel hash,
                 // so the speckle halo drops out and only a clean crack shape remains
     float wq = MASK_Q, fq = MASK_Q;
@@ -83,17 +82,9 @@ vec2 fbm22(vec2 p) {
 // use its screen derivatives for the pixel scale. d itself has seams where the nearest
 // border switches, so differentiating d directly paints those seams as false lines.
 // halfPx returns this crack's random line half-width in pixels (WIDTH_MIN..WIDTH_MAX).
-// cellSite returns the warped-space position identifying which Voronoi cell U falls in
-// (same value for every point in one cell; compare cellSite to tell cells apart).
-float crackDist(vec2 U, out vec2 W, out float halfPx, out vec2 cellSite) {
-    U += seed;
-    W = U + ZEBRA_AMP * fbm22(U);
-    return voronoiB( W, halfPx, cellSite );
-}
-
-// convenience overload for callers that only need distance/width, not cell identity
 float crackDist(vec2 U, out vec2 W, out float halfPx) {
-    vec2 cellSite;
-    return crackDist(U, W, halfPx, cellSite);
+    U += seed;
+    W = U + zebraAmp * fbm22(U * noiseFreq);
+    return voronoiB( W, halfPx );
 }
 `;
