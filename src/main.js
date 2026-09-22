@@ -8,7 +8,7 @@ const MARGIN = 1.25;    // plane oversize factor so edges don't show on resize o
 const SEED = [Math.random() * 100, Math.random() * 100];   // random per page load; hardcode for a reproducible layout
 const IS_TOUCH = matchMedia('(hover: none) and (pointer: coarse)').matches;
 
-const SCATTER_N = 8700;      // instances to place (default for the GUI slider)
+const SCATTER_N = 9400;      // instances to place (default for the GUI slider)
 const SCATTER_MAX = 20000;   // InstancedMesh capacity, and the GUI slider's max
 const SCATTER_LIFT = .02;    // z-offset above the shader plane so instances don't z-fight it
 const SCATTER_DEPTH = .15;   // random extra height on top of SCATTER_LIFT, world units (typical dot ~.045 across)
@@ -52,9 +52,9 @@ const plane = new THREE.Mesh(new THREE.PlaneGeometry(1, 1, SEGS, SEGS), new THRE
   uniforms: {
     seed: { value: new THREE.Vector2(...SEED) },
     patternScale: { value: .75 },
-    patternRatio: { value: 1.35 },
-    zebraAmp: { value: 1.2 },   // see crack.glsl.js
-    noiseFreq: { value: .85 },
+    patternRatio: { value: 1.05 },
+    zebraAmp: { value: 1.19 },   // see crack.glsl.js
+    noiseFreq: { value: .6 },
   },
   // uv -> pattern space (2 units = plane height at patternScale 1; higher = bigger cells), aspect
   // taken from the plane's own scale
@@ -444,7 +444,7 @@ function resize() {
 // settings panel (top right). Sliders rebuild on release, since a rebuild takes a few hundred ms
 const ui = {
   instances: IS_TOUCH ? 2700 : SCATTER_N,
-  scale: .55,
+  scale: 1.6,
   sizeVar: SCATTER_SIZE_VAR,
   shader: false,
   newSeed: () => { plane.material.uniforms.seed.value.set(Math.random() * 100, Math.random() * 100); resize(); },
