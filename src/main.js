@@ -6,6 +6,7 @@ import crack from './crack.glsl.js';
 const DIST = 3;         // camera distance; the background plane is sized to fill the window at this distance
 const MARGIN = 1.25;    // plane oversize factor so edges don't show on resize or orbit
 const SEED = [Math.random() * 100, Math.random() * 100];   // random per page load; hardcode for a reproducible layout
+const IS_TOUCH = matchMedia('(hover: none) and (pointer: coarse)').matches;
 
 const SCATTER_N = 8700;      // instances to place (default for the GUI slider)
 const SCATTER_MAX = 20000;   // InstancedMesh capacity, and the GUI slider's max
@@ -41,6 +42,7 @@ scene.background = new THREE.Color(0xffffff);
 const camera = new THREE.PerspectiveCamera(50, innerWidth / innerHeight, .1, 100);
 camera.position.set(0, 0, DIST);
 const controls = new OrbitControls(camera, renderer.domElement);
+if (IS_TOUCH) controls.enabled = false;   // lock camera on touch devices; finger still pushes dots via pointermove
 
 const SEGS = 50;   // wireframe subdivisions along the plane's shorter side; the longer side gets
                     // SEGS * aspect (recomputed in resize()) so each cell stays square on screen
@@ -441,7 +443,7 @@ function resize() {
 }
 // settings panel (top right). Sliders rebuild on release, since a rebuild takes a few hundred ms
 const ui = {
-  instances: SCATTER_N,
+  instances: IS_TOUCH ? 2700 : SCATTER_N,
   scale: 1.75,
   sizeVar: SCATTER_SIZE_VAR,
   shader: false,
