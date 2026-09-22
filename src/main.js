@@ -444,7 +444,7 @@ function resize() {
 // settings panel (top right). Sliders rebuild on release, since a rebuild takes a few hundred ms
 const ui = {
   instances: IS_TOUCH ? 2700 : SCATTER_N,
-  scale: 1.75,
+  scale: .55,
   sizeVar: SCATTER_SIZE_VAR,
   shader: false,
   newSeed: () => { plane.material.uniforms.seed.value.set(Math.random() * 100, Math.random() * 100); resize(); },
