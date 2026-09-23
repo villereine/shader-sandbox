@@ -294,7 +294,7 @@ function buildScatter(aspect, h) {
     head[cy * cols + cx] = i;
   }
   dots = {
-    n, x: hx.slice(), y: hy.slice(), px: hx.slice(), py: hy.slice(), hx, hy, r, m: r.map((v) => v * v),
+    n, x: hx.slice(), y: hy.slice(), px: hx.slice(), py: hy.slice(), sx0: hx.slice(), sy0: hy.slice(), hx, hy, r, m: r.map((v) => v * v),
     k: kAll.slice(0, n), la: Int32Array.from(la), lb: Int32Array.from(lb),
     ux: Float32Array.from(lux), uy: Float32Array.from(luy), rest: Float32Array.from(rest),
     dist, ghost: new Uint8Array(n), stillSince: new Float64Array(n).fill(-1),
@@ -319,7 +319,7 @@ const RELEASE_MIN = 2000, RELEASE_MAX = 5000;   // ms a trapped dot sits still (
 // timestamp (ms, from requestAnimationFrame) for the trapped-dot release timer. Returns the largest
 // per-dot move in the last substep, in px, for the sleep test
 function stepDots(s, mx, my, p, now = performance.now()) {
-  const { n, x, y, px, py, hx, hy, r, m, la, lb, ux, uy, rest, dist, ghost, stillSince, releaseDelay, maxR, mw, mh } = s, cr = p.cursor * mh;
+  const { n, x, y, px, py, sx0, sy0, hx, hy, r, m, la, lb, ux, uy, rest, dist, ghost, stillSince, releaseDelay, maxR, mw, mh } = s, cr = p.cursor * mh;
   // px to the nearest crack, bilinear between pixel centers so the wall is smooth: a per-pixel
   // field made pushed-out dots overshoot, then spring back in, forever. Clamped to the mask edge
   const sd = (X, Y) => {
@@ -332,7 +332,7 @@ function stepDots(s, mx, my, p, now = performance.now()) {
   for (let sub = 0; sub < 2; sub++) {
     for (let i = 0; i < n; i++) {
       const vx = (x[i] - px[i]) * p.damping, vy = (y[i] - py[i]) * p.damping;
-      px[i] = x[i]; py[i] = y[i];
+      sx0[i] = x[i]; sy0[i] = y[i];   // position before this substep's forces -- the wall pass's reference
       x[i] += vx + (hx[i] - x[i]) * p.spring;
       y[i] += vy + (hy[i] - y[i]) * p.spring;
       const dx = x[i] - mx, dy = y[i] - my, dd = dx * dx + dy * dy, reach = cr + r[i];
@@ -366,11 +366,11 @@ function stepDots(s, mx, my, p, now = performance.now()) {
         // truly extreme cursor+push+width combinations (see CLAUDE.md) can still slip past. Only
         // dots that moved that far this substep pay for walking the path; everything else keeps
         // the cheap grid early-exit below unchanged
-        const mdx = x[i] - px[i], mdy = y[i] - py[i], moveSq = mdx * mdx + mdy * mdy;
+        const mdx = x[i] - sx0[i], mdy = y[i] - sy0[i], moveSq = mdx * mdx + mdy * mdy;
         if (moveSq > 1) {
           const steps = Math.min(64, Math.ceil(Math.sqrt(moveSq) / (c * .5)));
           for (let st = 1; st < steps; st++) {
-            const t = st / steps, sx = px[i] + mdx * t, sy = py[i] + mdy * t;
+            const t = st / steps, sx = sx0[i] + mdx * t, sy = sy0[i] + mdy * t;
             if (sd(sx, sy) < c) { x[i] = sx; y[i] = sy; break; }   // first unsafe sample; refine below
           }
         } else if (dist[Math.floor(y[i]) * mw + Math.floor(x[i])] >= (c + 1.5) ** 2) continue;   // clearly clear
@@ -378,9 +378,16 @@ function stepDots(s, mx, my, p, now = performance.now()) {
         if (d >= c) continue;
         const gx = sd(x[i] + 1, y[i]) - sd(x[i] - 1, y[i]), gy = sd(x[i], y[i] + 1) - sd(x[i], y[i] - 1), g = Math.hypot(gx, gy);
         if (g > 0) { x[i] += gx / g * (c - d + .01); y[i] += gy / g * (c - d + .01); }
-        if (!(sd(x[i], y[i]) >= c - .05)) { x[i] = px[i]; y[i] = py[i]; }   // concave corner: back off
+        if (!(sd(x[i], y[i]) >= c - .05)) { x[i] = sx0[i]; y[i] = sy0[i]; }   // concave corner: back off
       }
     }
+    // px/py capture position after this substep's forces AND corrections settle (not sx0's
+    // pre-force snapshot): next substep's velocity is (new x - px), so a push's snap or a wall's
+    // corrective pull-back are repositions, not impulses, and don't get misread as momentum and
+    // carried forward. Without this, a dot the cursor shoves hard -- whether from passing almost
+    // exactly over it (d near 0) or just a big push that overshoots into a wall -- keeps drifting
+    // for several frames after, decaying only by p.damping
+    for (let i = 0; i < n; i++) { px[i] = x[i]; py[i] = y[i]; }
   }
   // Walls make islands non-convex, so a pushed dot can settle where its way home is blocked: a neck
   // narrower than the dot, or neighbors pinned against a wall. A dot away from home, clear of the
@@ -389,7 +396,7 @@ function stepDots(s, mx, my, p, now = performance.now()) {
   // so a big sweep's trapped dots free up staggered instead of snapping back all at once
   const zone = cr + 4 * maxR, zoneSq = zone * zone;   // cursor reach plus a few dots of neighbors it's still working on
   for (let i = 0; i < n; i++) {
-    const dm = Math.abs(x[i] - px[i]) + Math.abs(y[i] - py[i]);
+    const dm = Math.abs(x[i] - sx0[i]) + Math.abs(y[i] - sy0[i]);   // total move this substep (sx0, not px: px now excludes the push)
     moved = Math.max(moved, dm);
     if (ghost[i]) {
       if (Math.abs(x[i] - hx[i]) + Math.abs(y[i] - hy[i]) < .5) ghost[i] = 0;   // home: solid again
@@ -530,7 +537,7 @@ if (import.meta.env.DEV) {   // self-check: stepDots on tiny 40x40 states (links
   const mk = (pts, links, dist) => {   // pts: [x, y, r], links: [a, b, rest]; u from the homes
     const col = (c) => Float32Array.from(pts, (q) => q[c]), x = col(0), y = col(1), r = col(2);
     const u = (l, c) => (pts[l[1]][c] - pts[l[0]][c]) / Math.hypot(pts[l[1]][0] - pts[l[0]][0], pts[l[1]][1] - pts[l[0]][1]);
-    return { n: pts.length, x, y, px: x.slice(), py: y.slice(), hx: x.slice(), hy: y.slice(), r, m: r.map((v) => v * v),
+    return { n: pts.length, x, y, px: x.slice(), py: y.slice(), sx0: x.slice(), sy0: y.slice(), hx: x.slice(), hy: y.slice(), r, m: r.map((v) => v * v),
       la: Int32Array.from(links, (l) => l[0]), lb: Int32Array.from(links, (l) => l[1]),
       ux: Float32Array.from(links, (l) => u(l, 0)), uy: Float32Array.from(links, (l) => u(l, 1)),
       rest: Float32Array.from(links, (l) => l[2]), dist, ghost: new Uint8Array(pts.length),
@@ -551,11 +558,27 @@ if (import.meta.env.DEV) {   // self-check: stepDots on tiny 40x40 states (links
   for (let y = 0; y < W; y++) edt1d(wall, y * W, 1, W, nf, nv, nz);   // crack at x >= 30
   const c = mk([[20, 20, 3]], [], wall);
   let ok = true;
-  for (let i = 0; i < 60; i++) {   // cursor ball shoves the dot right, into the wall
+  // cursor ball approaches from the left and shoves the dot right, into the wall; stops at i=30
+  // (cursor.x=23) well short of the dot's ~26.5 resting spot, so the cursor's own ball never fully
+  // overtakes it -- once it does (see the dedicated overtaking test below), the dot correctly gets
+  // ejected out the far side instead of staying pinned, which isn't what this test is checking
+  for (let i = 0; i < 30; i++) {
     stepDots(c, 20 - 12 + i * .5, 20, { cursor: .25, push: 1, spring: 0, damping: .9 }, i);
     ok &&= wall[Math.floor(c.y[0]) * W + Math.floor(c.x[0])] >= (c.r[0] + 1 - 1e-3) ** 2;
   }
   console.assert(ok && c.x[0] > 21, 'stepDots: wall let a dot reach the crack, or the dot never moved');
+  // dedicated phantom-velocity check: sweep the same cursor all the way through and past the dot
+  // (unlike the test above). It must eject the dot cleanly to the far side -- bounded, one-time --
+  // never drifting further on later frames the way an unresynced px/py used to (see CLAUDE.md)
+  const ov = mk([[20, 20, 3]], [], wall);
+  let ovOk = true, maxStep = 0, prevX = ov.x[0];
+  for (let i = 0; i < 60; i++) {
+    stepDots(ov, 20 - 12 + i * .5, 20, { cursor: .25, push: 1, spring: 0, damping: .9 }, i);
+    ovOk &&= wall[Math.floor(ov.y[0]) * W + Math.floor(ov.x[0])] >= (ov.r[0] + 1 - 1e-3) ** 2;
+    maxStep = Math.max(maxStep, Math.abs(ov.x[0] - prevX));
+    prevX = ov.x[0];
+  }
+  console.assert(ovOk && maxStep < 20, 'stepDots: cursor overtaking a dot caused runaway drift (phantom velocity)');
   // thin (1px) crack with land on both sides -- unlike the block wall above, this is the actual
   // tunneling shape: a single hard push must not skip clean over it in one substep
   const thin = new Float32Array(W * W).map((_, q) => (q % W === 30 ? 0 : 1e20));
