@@ -8,7 +8,7 @@ const MARGIN = 1.25;    // plane oversize factor so edges don't show on resize o
 const SEED = [Math.random() * 100, Math.random() * 100];   // random per page load; hardcode for a reproducible layout
 const IS_TOUCH = matchMedia('(hover: none) and (pointer: coarse)').matches;
 
-const SCATTER_N = 8700;      // instances to place (default for the GUI slider)
+const SCATTER_N = 15100;     // instances to place (default for the GUI slider)
 const SCATTER_MAX = 20000;   // InstancedMesh capacity, and the GUI slider's max
 const SCATTER_LIFT = .02;    // z-offset above the shader plane so instances don't z-fight it
 const SCATTER_DEPTH = .15;   // random extra height on top of SCATTER_LIFT, world units (typical dot ~.045 across)
@@ -16,11 +16,12 @@ const SCATTER_SHADE = .6;    // how much darker the lowest dots are than the hig
 const SCATTER_MIN_SIZE = .3; // smallest an instance may shrink to fit beside a crack (fraction of base size);
                               // spots too tight even for that are skipped
 const SCATTER_BASE_SIZE = .013; // typical (median) instance size, as a fraction of plane height
-const SCATTER_SIZE_VAR = .4; // log-normal size spread (GUI default); 0 = all one size, .4 = roughly
-                              // 0.45x to 2.2x the typical size at the 2-sigma clamp
+const SCATTER_SIZE_VAR = .25; // log-normal size spread (GUI default); 0 = all one size, .25 = roughly
+                              // 0.6x to 1.65x the typical size at the 2-sigma clamp
 const SCATTER_FALLOFF = .03; // distance from a crack (fraction of plane height) over which density ramps
                               // from SCATTER_MIN_DENSITY up to full
 const SCATTER_MIN_DENSITY = .05; // placement probability right at a crack edge (fraction of full density)
+const SCATTER_MIN_ISLAND = 50; // islands that would get fewer instances than this get none: too small to read as a colored patch
 const SCATTER_EDGE = 0;      // how far out from a crack instances must stay: 0 = right up to the solid
                               // black, 1 = clear of the whole speckle halo (0..1)
 const SCATTER_FLOW_FREQ = 1.2; // flow-field noise cells per pattern unit (2 units = plane height);
@@ -51,10 +52,12 @@ const SEGS = 50;   // wireframe subdivisions along the plane's shorter side; the
 const plane = new THREE.Mesh(new THREE.PlaneGeometry(1, 1, SEGS, SEGS), new THREE.ShaderMaterial({
   uniforms: {
     seed: { value: new THREE.Vector2(...SEED) },
-    patternScale: { value: .75 },
-    patternRatio: { value: 1.35 },
+    patternScale: { value: .55 },
+    patternRatio: { value: 1 },
     zebraAmp: { value: 1.2 },   // see crack.glsl.js
-    noiseFreq: { value: .85 },
+    noiseFreq: { value: .5 },
+    widthMin: { value: 5 },   // crack line half-width range, in pixels; see crack.glsl.js
+    widthMax: { value: 9 },
   },
   // uv -> pattern space (2 units = plane height at patternScale 1; higher = bigger cells), aspect
   // taken from the plane's own scale
@@ -222,6 +225,7 @@ function buildScatter(aspect, h) {
   // per-dot physics data, filled as dots are placed: home (mask px), radius, depth factor, island
   const hxAll = new Float32Array(ui.instances), hyAll = new Float32Array(ui.instances);
   const rAll = new Float32Array(ui.instances), kAll = new Float32Array(ui.instances), isl = new Int32Array(ui.instances);
+  const tally = new Int32Array(islands);   // instances per island, tallied as they're placed below
   let count = 0;
   for (let n = 0; n < ui.instances * 4 && count < ui.instances; n++) {   // up to 4 tries per instance
     const x = Math.floor(Math.random() * mw), y = Math.floor(Math.random() * mh);
@@ -248,8 +252,23 @@ function buildScatter(aspect, h) {
     _m.setPosition(((x + .5) / mw - .5) * h * aspect * k, ((y + .5) / mh - .5) * h * k, z);
     scatter.setColorAt(count, _c.copy(islandColor[island[y * mw + x]]).multiplyScalar(1 - SCATTER_SHADE * (1 - lift)));   // lower = darker
     hxAll[count] = x + .5; hyAll[count] = y + .5; rAll[count] = size / 2; kAll[count] = k; isl[count] = island[y * mw + x];
+    tally[island[y * mw + x]]++;
     scatter.setMatrixAt(count++, _m);
   }
+  // islands too small to carry SCATTER_MIN_ISLAND instances don't exist: drop their dots by
+  // compacting the survivors down over them, reusing what's already on the InstancedMesh
+  let kept = 0;
+  for (let i = 0; i < count; i++) {
+    if (tally[isl[i]] < SCATTER_MIN_ISLAND) continue;
+    if (kept !== i) {
+      scatter.getMatrixAt(i, _m); scatter.setMatrixAt(kept, _m);
+      scatter.getColorAt(i, _c); scatter.setColorAt(kept, _c);
+      hxAll[kept] = hxAll[i]; hyAll[kept] = hyAll[i]; rAll[kept] = rAll[i]; kAll[kept] = kAll[i]; isl[kept] = isl[i];
+    }
+    kept++;
+  }
+  count = kept;
+
   scatter.count = count;
   scatter.instanceMatrix.needsUpdate = true;
   if (scatter.instanceColor) scatter.instanceColor.needsUpdate = true;   // absent until the first setColorAt (0x0 window)
@@ -278,7 +297,9 @@ function buildScatter(aspect, h) {
     n, x: hx.slice(), y: hy.slice(), px: hx.slice(), py: hy.slice(), hx, hy, r, m: r.map((v) => v * v),
     k: kAll.slice(0, n), la: Int32Array.from(la), lb: Int32Array.from(lb),
     ux: Float32Array.from(lux), uy: Float32Array.from(luy), rest: Float32Array.from(rest),
-    dist, ghost: new Uint8Array(n), maxR, mw, mh, h, aspect,
+    dist, ghost: new Uint8Array(n), stillSince: new Float64Array(n).fill(-1),
+    releaseDelay: Float32Array.from({ length: n }, () => RELEASE_MIN + Math.random() * (RELEASE_MAX - RELEASE_MIN)),
+    maxR, mw, mh, h, aspect,
   };
 }
 
@@ -287,14 +308,18 @@ function buildScatter(aspect, h) {
 // overlapping layout is stable and a push travels through neighbors like colliding balls. Cracks
 // are walls via the distance transform. The cursor is a solid ball. Runs only while something moves
 let dots = null;
-const LINK_PASSES = 1;   // links + walls passes per substep; 2 made pushes travel stiffer but cost ~2ms more per frame at 8700 dots
-const phys ={ cursor: .04, push: .5, spring: .02, damping: .9 };   // GUI "physics" folder; cursor = fraction of plane height
+const LINK_PASSES = 1;   // links + walls passes per substep; 2 made pushes travel stiffer but cost more per frame -- unmeasured at the current SCATTER_N, was ~2ms at 8700 dots
+const phys ={ cursor: .02, push: .7, spring: .01, damping: .9 };   // GUI "physics" folder; cursor = fraction of plane height
+const RELEASE_MIN = 2000, RELEASE_MAX = 5000;   // ms a trapped dot sits still (away from home, clear of the
+                                                 // cursor) before it ghosts home; randomized per dot so a big
+                                                 // sweep releases its trapped dots staggered, not all at once
 
 // one frame: 2 substeps of verlet + spring home and the cursor ball, then LINK_PASSES passes of
-// links and crack walls. p: phys-shaped params (passed in so the dev self-check can use its own). Returns
-// the largest per-dot move in the last substep, in px, for the sleep test
-function stepDots(s, mx, my, p) {
-  const { n, x, y, px, py, hx, hy, r, m, la, lb, ux, uy, rest, dist, ghost, mw, mh } = s, cr = p.cursor * mh;
+// links and crack walls. p: phys-shaped params (passed in so the dev self-check can use its own). now:
+// timestamp (ms, from requestAnimationFrame) for the trapped-dot release timer. Returns the largest
+// per-dot move in the last substep, in px, for the sleep test
+function stepDots(s, mx, my, p, now = performance.now()) {
+  const { n, x, y, px, py, hx, hy, r, m, la, lb, ux, uy, rest, dist, ghost, stillSince, releaseDelay, maxR, mw, mh } = s, cr = p.cursor * mh;
   // px to the nearest crack, bilinear between pixel centers so the wall is smooth: a per-pixel
   // field made pushed-out dots overshoot, then spring back in, forever. Clamped to the mask edge
   const sd = (X, Y) => {
@@ -332,10 +357,23 @@ function stepDots(s, mx, my, p) {
       // gradient, so the dot slides along the wall. Reverting the whole move instead also threw
       // away the spring's pull home, pinning dots (and, through links, their neighbors) at walls
       for (let i = 0; i < n; i++) {
-        if (ghost[i]) continue;   // see releaseTrapped
+        if (ghost[i]) continue;   // ghosting dots skip walls -- see the trapped-release check below
         const c = r[i] + 1 - 1e-3;   // the 1e-3: dots placed exactly at the limit
-        // clearly clear (bilinear is within ~1.42px of the pixel value): skip the bilinear
-        if (dist[Math.floor(y[i]) * mw + Math.floor(x[i])] >= (c + 1.5) ** 2) continue;
+        // tunneling: a hard push can move a dot more than the ~1px wall band in one substep,
+        // jumping clean over it between samples. Spacing is tied to c (the actual clearance,
+        // typically a few px) so it can't outrun a thin crack; capped at 64 samples for a bound on
+        // worst-case cost, which still covers pushes into the hundreds of px at typical c -- only
+        // truly extreme cursor+push+width combinations (see CLAUDE.md) can still slip past. Only
+        // dots that moved that far this substep pay for walking the path; everything else keeps
+        // the cheap grid early-exit below unchanged
+        const mdx = x[i] - px[i], mdy = y[i] - py[i], moveSq = mdx * mdx + mdy * mdy;
+        if (moveSq > 1) {
+          const steps = Math.min(64, Math.ceil(Math.sqrt(moveSq) / (c * .5)));
+          for (let st = 1; st < steps; st++) {
+            const t = st / steps, sx = px[i] + mdx * t, sy = py[i] + mdy * t;
+            if (sd(sx, sy) < c) { x[i] = sx; y[i] = sy; break; }   // first unsafe sample; refine below
+          }
+        } else if (dist[Math.floor(y[i]) * mw + Math.floor(x[i])] >= (c + 1.5) ** 2) continue;   // clearly clear
         const d = sd(x[i], y[i]);
         if (d >= c) continue;
         const gx = sd(x[i] + 1, y[i]) - sd(x[i] - 1, y[i]), gy = sd(x[i], y[i] + 1) - sd(x[i], y[i] - 1), g = Math.hypot(gx, gy);
@@ -344,26 +382,28 @@ function stepDots(s, mx, my, p) {
       }
     }
   }
+  // Walls make islands non-convex, so a pushed dot can settle where its way home is blocked: a neck
+  // narrower than the dot, or neighbors pinned against a wall. A dot away from home, clear of the
+  // cursor (so a resting cursor keeps its hole), and not moving ghosts home (walls and links skip a
+  // ghost until it arrives) once it's sat that way for its own randomized RELEASE_MIN..RELEASE_MAX,
+  // so a big sweep's trapped dots free up staggered instead of snapping back all at once
+  const zone = cr + 4 * maxR, zoneSq = zone * zone;   // cursor reach plus a few dots of neighbors it's still working on
   for (let i = 0; i < n; i++) {
-    moved = Math.max(moved, Math.abs(x[i] - px[i]) + Math.abs(y[i] - py[i]));
-    if (ghost[i] && Math.abs(x[i] - hx[i]) + Math.abs(y[i] - hy[i]) < .5) ghost[i] = 0;   // home: solid again
+    const dm = Math.abs(x[i] - px[i]) + Math.abs(y[i] - py[i]);
+    moved = Math.max(moved, dm);
+    if (ghost[i]) {
+      if (Math.abs(x[i] - hx[i]) + Math.abs(y[i] - hy[i]) < .5) ghost[i] = 0;   // home: solid again
+      continue;
+    }
+    const hdx = x[i] - hx[i], hdy = y[i] - hy[i], cdx = x[i] - mx, cdy = y[i] - my;
+    const stuck = dm < .02 && hdx * hdx + hdy * hdy > .25 && cdx * cdx + cdy * cdy >= zoneSq;
+    // stillSince < 0 means "timer not running" -- 0 can't be the sentinel since now (a real rAF
+    // timestamp) can legitimately be 0, which would otherwise look unset and never latch
+    if (!stuck) stillSince[i] = -1;
+    else if (stillSince[i] < 0) stillSince[i] = now;
+    else if (now - stillSince[i] >= releaseDelay[i]) ghost[i] = 1;
   }
   return moved;
-}
-
-// Walls make islands non-convex, so a pushed dot can settle where its way home is blocked: a neck
-// narrower than the dot, or neighbors pinned against a wall. Once everything is still, every dot
-// away from home and clear of the cursor ghosts home (walls and links skip it until it arrives).
-// Dots near the cursor stay put, so a resting cursor keeps its hole. Returns whether any were freed
-function releaseTrapped(s, mx, my, p) {
-  const zone = p.cursor * s.mh + 4 * s.maxR;   // cursor reach plus a few dots of neighbors pinned by it
-  let freed = false;
-  for (let i = 0; i < s.n; i++) {
-    if (s.ghost[i] || Math.hypot(s.x[i] - s.hx[i], s.y[i] - s.hy[i]) <= .5 || Math.hypot(s.x[i] - mx, s.y[i] - my) < zone) continue;
-    s.ghost[i] = 1;
-    freed = true;
-  }
-  return freed;
 }
 
 // write dot positions into the instance matrices' translation (rotation/scale never change),
@@ -392,22 +432,20 @@ renderer.domElement.addEventListener('pointermove', (e) => {
 });
 renderer.domElement.addEventListener('pointerleave', () => { cursor.x = cursor.y = -1e9; wake(); });
 
-// rAF loop only while awake; sleeps after 30 frames with no dot moving more than .02 px
+// rAF loop only while awake; sleeps after 30 frames with no dot moving more than .02 px and no
+// trapped dot mid-countdown toward its release (see stepDots)
 let running = false, still = 0;
 function wake() {
   still = 0;
   if (!running) { running = true; requestAnimationFrame(tick); }
 }
-function tick() {
+function tick(now) {
   if (!dots || !dots.n) { running = false; return; }
-  const moved = stepDots(dots, cursor.x, cursor.y, phys);
+  const moved = stepDots(dots, cursor.x, cursor.y, phys, now);
   writeDots(dots);
   render();
   still = moved < .02 ? still + 1 : 0;
-  if (still >= 30) {   // settled: free any trapped dots, or sleep
-    if (!releaseTrapped(dots, cursor.x, cursor.y, phys)) { running = false; return; }
-    still = 0;
-  }
+  if (still >= 30 && !dots.stillSince.some((t) => t)) { running = false; return; }
   requestAnimationFrame(tick);
 }
 
@@ -444,7 +482,7 @@ function resize() {
 // settings panel (top right). Sliders rebuild on release, since a rebuild takes a few hundred ms
 const ui = {
   instances: IS_TOUCH ? 2700 : SCATTER_N,
-  scale: 1.75,
+  scale: 1.4,
   sizeVar: SCATTER_SIZE_VAR,
   shader: false,
   newSeed: () => { plane.material.uniforms.seed.value.set(Math.random() * 100, Math.random() * 100); resize(); },
@@ -460,6 +498,8 @@ shaderUI.add(u.patternScale, 'value', .3, 3, .05).name('shader scale').onChange(
 shaderUI.add(u.patternRatio, 'value', .25, 4, .05).name('shader ratio').onChange(render).onFinishChange(resize);
 shaderUI.add(u.zebraAmp, 'value', 0, 1.2, .01).name('warp amp').onChange(render).onFinishChange(resize);
 shaderUI.add(u.noiseFreq, 'value', .2, 4, .05).name('warp noise').onChange(render).onFinishChange(resize);
+shaderUI.add(u.widthMin, 'value', 1, 20, .5).name('crack width min').onChange(render).onFinishChange(resize);
+shaderUI.add(u.widthMax, 'value', 1, 20, .5).name('crack width max').onChange(render).onFinishChange(resize);
 shaderUI.add(ui, 'newSeed').name('new seed');
 // hides the plane from the main camera only: maskCam still sees layer 0, so placement is unaffected
 shaderUI.add(ui, 'shader').name('show shader').onChange((v) => { camera.layers[v ? 'enable' : 'disable'](0); render(); });
@@ -473,7 +513,7 @@ physUI.add(phys, 'damping', .5, .99, .01);
 
 addEventListener('resize', resize);
 resize();
-if (import.meta.env.DEV) window.dbg = { renderer, scene, camera, scatter, plane, maskMat, phys, cursor, stepDots, releaseTrapped, get dots() { return dots; }, get running() { return running; } };   // for the checks in CLAUDE.md
+if (import.meta.env.DEV) window.dbg = { renderer, scene, camera, scatter, plane, maskMat, phys, cursor, stepDots, get dots() { return dots; }, get running() { return running; } };   // for the checks in CLAUDE.md
 
 if (import.meta.env.DEV) {   // self-check: edt1d against brute force on a random 40x30 grid
   const W = 40, H = 30, g = Float32Array.from({ length: W * H }, () => (Math.random() < .05 ? 0 : 1e20));
@@ -493,15 +533,18 @@ if (import.meta.env.DEV) {   // self-check: stepDots on tiny 40x40 states (links
     return { n: pts.length, x, y, px: x.slice(), py: y.slice(), hx: x.slice(), hy: y.slice(), r, m: r.map((v) => v * v),
       la: Int32Array.from(links, (l) => l[0]), lb: Int32Array.from(links, (l) => l[1]),
       ux: Float32Array.from(links, (l) => u(l, 0)), uy: Float32Array.from(links, (l) => u(l, 1)),
-      rest: Float32Array.from(links, (l) => l[2]), dist, ghost: new Uint8Array(pts.length), mw: W, mh: W };
+      rest: Float32Array.from(links, (l) => l[2]), dist, ghost: new Uint8Array(pts.length),
+      // stillSince/releaseDelay: huge delay so the release-timer logic never fires mid-test
+      stillSince: new Float64Array(pts.length).fill(-1), releaseDelay: new Float32Array(pts.length).fill(1e9),
+      maxR: Math.max(...r), mw: W, mh: W };
   };
   const off = -1e9, inert = { cursor: 0, push: 0, spring: 0, damping: 0 };
   const a = mk([[18, 20, 3], [20, 20, 3]], [[0, 1, 6]], open);   // 2px apart, rest 6
-  for (let i = 0; i < 5; i++) stepDots(a, off, off, inert);
+  for (let i = 0; i < 5; i++) stepDots(a, off, off, inert, i);
   console.assert(Math.hypot(a.x[1] - a.x[0], a.y[1] - a.y[0]) >= 6 - 1e-3, 'stepDots: link left dots closer than rest');
   const b = mk([[20, 20, 3]], [], open);
   b.x[0] = b.px[0] = 26;   // displaced 6px from home
-  for (let i = 0; i < 300; i++) stepDots(b, off, off, { cursor: 0, push: 0, spring: .05, damping: .9 });
+  for (let i = 0; i < 300; i++) stepDots(b, off, off, { cursor: 0, push: 0, spring: .05, damping: .9 }, i);
   console.assert(Math.hypot(b.x[0] - 20, b.y[0] - 20) < .5, 'stepDots: dot did not return home');
   const wall = new Float32Array(W * W).map((_, q) => (q % W >= 30 ? 0 : 1e20)), nf = new Float64Array(W), nv = new Int32Array(W), nz = new Float64Array(W + 1);
   for (let x = 0; x < W; x++) edt1d(wall, x, W, W, nf, nv, nz);
@@ -509,8 +552,18 @@ if (import.meta.env.DEV) {   // self-check: stepDots on tiny 40x40 states (links
   const c = mk([[20, 20, 3]], [], wall);
   let ok = true;
   for (let i = 0; i < 60; i++) {   // cursor ball shoves the dot right, into the wall
-    stepDots(c, 20 - 12 + i * .5, 20, { cursor: .25, push: 1, spring: 0, damping: .9 });
+    stepDots(c, 20 - 12 + i * .5, 20, { cursor: .25, push: 1, spring: 0, damping: .9 }, i);
     ok &&= wall[Math.floor(c.y[0]) * W + Math.floor(c.x[0])] >= (c.r[0] + 1 - 1e-3) ** 2;
   }
   console.assert(ok && c.x[0] > 21, 'stepDots: wall let a dot reach the crack, or the dot never moved');
+  // thin (1px) crack with land on both sides -- unlike the block wall above, this is the actual
+  // tunneling shape: a single hard push must not skip clean over it in one substep
+  const thin = new Float32Array(W * W).map((_, q) => (q % W === 30 ? 0 : 1e20));
+  const tf = new Float64Array(W), tv = new Int32Array(W), tz = new Float64Array(W + 1);
+  for (let x = 0; x < W; x++) edt1d(thin, x, W, W, tf, tv, tz);
+  for (let y = 0; y < W; y++) edt1d(thin, y * W, 1, W, tf, tv, tz);
+  const th = mk([[25, 20, 3]], [], thin);
+  stepDots(th, 23, 20, { cursor: .25, push: 1, spring: 0, damping: .9 }, 1);
+  console.assert(th.x[0] < 30 && thin[Math.floor(th.y[0]) * W + Math.floor(th.x[0])] >= (th.r[0] + 1 - 1e-3) ** 2,
+    'stepDots: a hard push tunneled through a thin crack');
 }
