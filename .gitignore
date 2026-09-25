@@ -3,3 +3,6 @@ dist/
 scratch-*.png
 .claude/
 CLAUDE.md
+caveman/
+graphify/
+graphify-out/

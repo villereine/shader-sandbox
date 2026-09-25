@@ -8,8 +8,7 @@ uniform float zebraAmp;   // fbm warp strength of the cells (GUI "warp amp"); ab
 uniform float noiseFreq;  // fbm warp frequency (GUI "warp noise"); higher = finer wiggles along cracks
 const float FILLET_MIN = .2;       // per-cell random fillet radius range; rounds sharp crack junctions, 0 = hard-min corners
 const float FILLET_MAX = .5;
-const float WIDTH_MIN = 5.;       // per-crack random line half-width range, in pixels (see main.js HALF_PX)
-const float WIDTH_MAX = 9.;
+uniform float widthMin, widthMax;   // per-crack random line half-width range, in pixels (GUI "crack width")
 
 // mod289 keeps sin()'s argument bounded before hashing -- GPU sin() loses precision fast on large
 // arguments (mat2/dot below multiply p by ~100-300x), which reads as concentric ripple/grain
@@ -34,7 +33,7 @@ vec2 site( vec2 iu, vec2 u, int k ) {
     return p - u + disp(p);
 }
 
-// distance to Voronoi borders. width: per-cell random line half-width (WIDTH_MIN..WIDTH_MAX), hashed from the winning site.
+// distance to Voronoi borders. width: per-cell random line half-width (widthMin..widthMax), hashed from the winning site.
 float voronoiB( vec2 u, out float width ) {
     vec2 iu = floor(u), P;
     float m = 1e9;
@@ -49,7 +48,7 @@ float voronoiB( vec2 u, out float width ) {
 #else
     float wq = hash21(iu + u - P), fq = hash21(iu + u - P + 31.4);
 #endif
-    width = WIDTH_MIN + (WIDTH_MAX - WIDTH_MIN) * wq;
+    width = min(widthMin, widthMax) + abs(widthMax - widthMin) * wq;   // safe if the GUI sliders cross
     float fillet = FILLET_MIN + (FILLET_MAX - FILLET_MIN) * fq;
     m = 1e9;
     for( int k=0; k < 49; k++ ) {
@@ -81,7 +80,7 @@ vec2 fbm22(vec2 p) {
 // Distance to the nearest crack, in warped space. W returns the warped coordinate:
 // use its screen derivatives for the pixel scale. d itself has seams where the nearest
 // border switches, so differentiating d directly paints those seams as false lines.
-// halfPx returns this crack's random line half-width in pixels (WIDTH_MIN..WIDTH_MAX).
+// halfPx returns this crack's random line half-width in pixels (widthMin..widthMax).
 float crackDist(vec2 U, out vec2 W, out float halfPx) {
     U += seed;
     W = U + zebraAmp * fbm22(U * noiseFreq);
