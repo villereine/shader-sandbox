@@ -26,8 +26,6 @@ const SCATTER_MIN_DENSITY = .05; // placement probability right at a crack edge 
 const SCATTER_MIN_ISLAND = 50; // islands that would get fewer instances than this get none: too small to read as a colored patch
 const SCATTER_EDGE = 0;      // how far out from a crack instances must stay: 0 = right up to the solid
                               // black, 1 = clear of the whole speckle halo (0..1)
-const SCATTER_FLOW_FREQ = 1.2; // flow-field noise cells per pattern unit (2 units = plane height);
-                              // higher = smaller swirls
 // dot color families; each island takes one color of the current family, picked so neighboring
 // islands differ. "new seed" steps to the next family
 // n even steps along a piecewise-linear ramp through the stops, so a 2-3 color swatch still has
@@ -90,16 +88,6 @@ const plane = new THREE.Mesh(new THREE.PlaneGeometry(1, 1, SEGS, SEGS), new THRE
   fragmentShader: /* glsl */ `
     ${crack}
     varying vec2 vUv;
-#ifdef MASK_Q
-    // Perlin gradient noise for the instance flow field. Not noise2: value noise's gradient is
-    // axis-aligned along every lattice line, which would show up as a grid in the flow
-    vec2 grad2(vec2 i) { float a = 6.2831853 * hash21(i); return vec2(cos(a), sin(a)); }
-    float perlin(vec2 p) {
-      vec2 i = floor(p), f = fract(p), u = f * f * (3. - 2. * f);
-      return mix(mix(dot(grad2(i), f), dot(grad2(i + vec2(1, 0)), f - vec2(1, 0)), u.x),
-                 mix(dot(grad2(i + vec2(0, 1)), f - vec2(0, 1)), dot(grad2(i + 1.), f - 1.), u.x), u.y);
-    }
-#endif
     void main() {
       vec2 W;
       float halfPx;
@@ -112,14 +100,6 @@ const plane = new THREE.Mesh(new THREE.PlaneGeometry(1, 1, SEGS, SEGS), new THRE
       const float AA_PX = .5;   // antialiasing falloff width in pixels; lower = sharper edge
       float a = clamp((halfPx - d / scale) / AA_PX + .5, 0., 1.);
       gl_FragColor = vec4(vec3(1. - a), 1.);
-#ifdef MASK_Q
-      // placement mask only: G/B carry each instance's screen-space direction, the curl of a Perlin
-      // noise (its gradient turned 90°), so directions follow the noise's contour lines and swirl
-      // around its highs and lows
-      float n = perlin((vUv + seed) * FLOW_FREQ);
-      vec2 g = vec2(-dFdy(n), dFdx(n));
-      gl_FragColor.gb = .5 + .5 * g / max(length(g), 1e-9);
-#endif
     }`,
 }));
 scene.add(plane);
@@ -133,7 +113,7 @@ wireframe.visible = false;
 plane.add(wireframe);   // child of plane: inherits its scale/position automatically
 
 // --- colored dots scattered over the "land" (non-crack) area, random sizes, shrunk near a crack
-// edge, rotated along the flow field. Flat in the plane's own surface (not billboarded to the
+// edge. Flat in the plane's own surface (not billboarded to the
 // camera), true circles on screen. NOT a child of `plane`: plane.scale is non-uniform
 // (h*aspect, h) to fill the window, and non-uniform scale doesn't commute with rotation -- a
 // child's own counter-scale only cancels the parent's stretch pre-rotation, then the parent
@@ -151,12 +131,10 @@ scene.add(scatter);
 // float32 sin-hash gives different values than JS float64, so the copy draws other cracks.
 // Instances and the wireframe live on layer 1, which maskCam doesn't render. The mask uses
 // maskMat, which swaps the per-pixel random crack width for SCATTER_EDGE (see MASK_Q in
-// crack.glsl.js), so the speckles around each crack count as land. It also writes a flow-field
-// direction into G/B (see the fragment shader), which sets each instance's rotation.
+// crack.glsl.js), so the speckles around each crack count as land.
 const maskMat = plane.material.clone();
 maskMat.uniforms = plane.material.uniforms;   // shared, so every GUI change reaches the mask too
 maskMat.defines.MASK_Q = SCATTER_EDGE.toFixed(3);   // GLSL needs a float literal
-maskMat.defines.FLOW_FREQ = SCATTER_FLOW_FREQ.toFixed(3);
 const maskCam = new THREE.OrthographicCamera();
 maskCam.position.z = 1;
 const maskRT = new THREE.WebGLRenderTarget(1, 1);
@@ -300,7 +278,7 @@ function buildScatter(aspect, h) {
   // triangulation -- Delaunay picks triangle connectivity for shape quality, it doesn't move vertices
   // toward a curve, so it can't smooth a jagged edge by itself; this is the vertex-relaxation step a
   // proper marching-squares boundary trace would give for free, applied directly to the existing grid
-  const sdAt = (X, Y) => {   // bilinear sqrt(dist), same formula as stepDots()'s wall pass
+  const sdAt = (X, Y) => {   // bilinear sqrt(dist), px to the nearest crack
     const fx = X - .5, fy = Y - .5, i = Math.min(mw - 2, Math.max(0, Math.floor(fx))), j = Math.min(mh - 2, Math.max(0, Math.floor(fy)));
     const tx = Math.min(1, Math.max(0, fx - i)), ty = Math.min(1, Math.max(0, fy - j)), q = j * mw + i;
     const A = Math.sqrt(dist[q]), B = Math.sqrt(dist[q + 1]), C = Math.sqrt(dist[q + mw]), E = Math.sqrt(dist[q + mw + 1]);
@@ -403,10 +381,7 @@ function buildScatter(aspect, h) {
     const k = (DIST - z) / DIST;   // pulls each instance in so it lands on the same screen pixel as
                                    // the plane point under it (default view), whatever its height
     const s = size / mh * h * k;   // mask px -> world units
-    // rotate so local +X points along the flow field (mask's G/B); invisible on round dots, matters for a non-round shape
-    _m.makeRotationZ(Math.atan2(px[(y * mw + x) * 4 + 2] - 127.5, px[(y * mw + x) * 4 + 1] - 127.5));
-    _m.scale(new THREE.Vector3(s, s, 1));
-    _m.setPosition(((x + .5) / mw - .5) * h * aspect * k, ((y + .5) / mh - .5) * h * k, z);
+    _m.makeScale(s, s, 1).setPosition(((x + .5) / mw - .5) * h * aspect * k, ((y + .5) / mh - .5) * h * k, z);
     scatter.setColorAt(count, _c.copy(islandColor[island[y * mw + x]]).lerp(SCATTER_SHADOW, SCATTER_SHADE * lift));   // higher = more shadow
     hxAll[count] = x + .5; hyAll[count] = y + .5; rAll[count] = size / 2; kAll[count] = k; isl[count] = island[y * mw + x];
     tally[island[y * mw + x]]++;
@@ -530,7 +505,7 @@ function stepDots(s, mx, my, p) {
   return moved;
 }
 
-// write dot positions into the instance matrices' translation (rotation/scale never change),
+// write dot positions into the instance matrices' translation (scale never changes),
 // same mapping as placement in buildScatter
 function writeDots(s) {
   const a = scatter.instanceMatrix.array;
@@ -674,7 +649,6 @@ shaderUI.add(u.widthMax, 'value', 1, 20, .5).name('crack width max').onChange(re
 // hides the plane from the main camera only: maskCam still sees layer 0, so placement is unaffected
 shaderUI.add(ui, 'shader').name('show shader').onChange((v) => { camera.layers[v ? 'enable' : 'disable'](0); render(); });
 if (!ui.shader) camera.layers.disable(0);   // apply the default; onChange only fires on user changes
-// read every frame, so these apply live
 // cursor/push/spring/damping sliders bound to a phys-shaped object, read live every frame
 function physFolder(name, obj) {
   const f = gui.addFolder(name);
