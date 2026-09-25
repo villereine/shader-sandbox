@@ -67,7 +67,7 @@ const SAT_SIGMA = .7;        // skin-weight falloff, as a fraction of the island
 const plane = new THREE.Mesh(new THREE.PlaneGeometry(1, 1, SEGS, SEGS), new THREE.ShaderMaterial({
   uniforms: {
     seed: { value: new THREE.Vector2(...SEED) },
-    patternScale: { value: .75 },
+    patternScale: { value: IS_TOUCH ? .5 : .75 },
     patternRatio: { value: 1 },
     zebraAmp: { value: 1.04 },   // see crack.glsl.js
     noiseFreq: { value: .7 },
@@ -461,8 +461,8 @@ let dots = null, isles = null, sats = null, verts = null;   // isles: one rigid 
 let islandGroup = null;   // parent of the per-island meshes cut from the plane
 const LINK_PASSES = 1;   // link passes per substep; 2 made pushes travel stiffer but cost more per frame -- unmeasured at the current SCATTER_N, was ~2ms at 8700 dots
 const phys ={ cursor: .03, push: 1, spring: .01, damping: .99 };   // GUI "physics" folder; cursor = fraction of plane height
-const physIslands = { cursor: .06, push: 1, spring: .025, damping: .55 };   // GUI "islands" folder (rigid centers); reach adds the center's own radius on top
-const physSats = { cursor: .025, push: 1, spring: .005, damping: .77 };   // GUI "satellites" folder; spring = how firmly a satellite follows its center
+const physIslands = { cursor: IS_TOUCH ? .015 : .06, push: 1, spring: .025, damping: .55 };   // GUI "islands" folder (rigid centers); reach adds the center's own radius on top
+const physSats = { cursor: IS_TOUCH ? .015 : .025, push: 1, spring: .005, damping: .77 };   // GUI "satellites" folder; spring = how firmly a satellite follows its center
 
 // one frame: 2 substeps of verlet + spring home and the cursor ball, then LINK_PASSES passes of
 // links. p: phys-shaped params (passed in so the dev self-check can use its own). Returns the
@@ -582,7 +582,7 @@ function tick() {
 }
 
 const stats = new Stats();   // fps / frame-time / memory panel, top-left; click to cycle panels
-document.body.appendChild(stats.dom);
+if (!IS_TOUCH) document.body.appendChild(stats.dom);   // touch: GUI hidden except the seed button
 
 // no per-frame loop: re-render on camera change, resize, and while the hover physics is awake
 const render = () => { stats.begin(); renderer.render(scene, camera); stats.end(); };
@@ -616,7 +616,7 @@ function resize() {
 }
 // settings panel (top right). Sliders rebuild on release, since a rebuild takes a few hundred ms
 const ui = {
-  instances: IS_TOUCH ? 2700 : SCATTER_N,
+  instances: IS_TOUCH ? 8000 : SCATTER_N,
   scale: 1.35,
   minSize: .9,    // taper: size factor at a crack edge
   maxSize: 1.1,   // and deep inside an island
@@ -630,7 +630,8 @@ const ui = {
   },
 };
 const gui = new GUI();
-gui.addFolder('seed').add(ui, 'newSeed').name('new seed');   // new layout + next color family
+const seedUI = gui.addFolder('seed');
+seedUI.add(ui, 'newSeed').name('new seed');   // new layout + next color family
 const dotsUI = gui.addFolder('dots');
 dotsUI.add(ui, 'instances', 0, SCATTER_MAX, 100).onFinishChange(resize);
 dotsUI.add(ui, 'scale', .2, 3, .05).name('dot scale').onFinishChange(resize);
@@ -661,6 +662,7 @@ function physFolder(name, obj) {
 physFolder('physics', phys);
 physFolder('islands', physIslands);   // rigid centers
 physFolder('satellites', physSats);
+if (IS_TOUCH) gui.folders.forEach((f) => f !== seedUI && f.hide());   // touch: only the seed button
 
 addEventListener('resize', resize);
 resize();
