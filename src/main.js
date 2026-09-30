@@ -7,9 +7,10 @@ import crack from './crack.glsl.js';
 const DIST = 3;         // canopy sizing distance: the plane is sized to fill the window seen from this distance
 const CAM_Z = 4.5;      // build-time sizing reference for the mask density and dot lift (DIST + 1 put the canopy inside the view with sky around it); the camera's own starting z is set separately below and can drift from this
 const MARGIN = 1.25;    // plane oversize factor so edges don't show on resize or orbit
-const PLANE_SCALE = 1.6;    // desktop canopy side beyond the window's long side; sizes (unit) don't change, so it adds area.
-                             // >= starting cam z / (DIST * MARGIN) so the square canopy (sized off DIST) still covers
-                             // the window's x axis at the camera's actual starting z (6), which sits farther back than DIST (3)
+const START_Z = 6;      // the camera's starting z (GUI "cam z"); PLANE_SCALE and TRUNK_END_Z follow it
+const PLANE_SCALE = START_Z / (DIST * MARGIN);    // desktop canopy side beyond the window's long side; sizes (unit) don't change, so it adds area.
+                             // = START_Z / (DIST * MARGIN) so the square canopy (sized off DIST) still covers
+                             // the window's x axis at the camera's starting z, which sits farther back than DIST
 const SEED = [Math.random() * 100, Math.random() * 100];   // random per page load; hardcode for a reproducible layout
 const IS_TOUCH = matchMedia('(hover: none) and (pointer: coarse)').matches;
 
@@ -53,7 +54,7 @@ document.body.appendChild(renderer.domElement);
 const scene = new THREE.Scene();
 scene.background = new THREE.Color(0x91b4c9);
 const camera = new THREE.PerspectiveCamera(90, innerWidth / innerHeight, .1, 100);
-camera.position.set(0, 0, 6);   // starting zoom (GUI "cam z"): independent of CAM_Z, which stays the build-time sizing reference
+camera.position.set(0, 0, START_Z);   // starting zoom (GUI "cam z"): independent of CAM_Z, which stays the build-time sizing reference
 const controls = new OrbitControls(camera, renderer.domElement);
 if (IS_TOUCH) controls.enabled = false;   // lock camera on touch devices; finger still pushes dots via pointermove
 
@@ -70,7 +71,9 @@ const SAT_SIGMA = .7;        // skin-weight falloff, as a fraction of the island
 // same way. The mesh and both lights sit on layer 1: maskCam (layer 0) must not draw trees into the
 // placement mask, and three.js layer-tests lights too, while the main camera drops layer 0 whenever
 // "show shader" is off
-const TRUNK_END_Z = 6.3;   // z of each leader's base, just past the camera's starting z (6, see camera.position.set above) so the far ends stay out of view
+const TRUNK_END_Z = START_Z + .3;   // z of each leader's base, just past the camera's starting z so the far ends stay out of view
+const FORK_TOP_GAP = .015;   // the highest lateral's fork sits this far (fraction of unit) above the canopy under the tree
+const taperAt = (r, t) => r * (1 + (ui.tipTaper - 1) * t);   // branch radius at fraction t of its length, from base radius r
 const TRUNK_FORK_SPREAD = .15;    // the lowest lateral's fork point is ui.forkStart plus up to this much further along the leader (0 base, 1 canopy)
 const TRUNK_NOISE_SCALE = .4;     // the leader gets this fraction of ui.noise; laterals get the full amount
 const BRANCH_REACH = .75;         // anchors spread over a disk this fraction of the island's radius around its centroid
@@ -273,8 +276,8 @@ function buildScatter(aspect, h, unit) {
   const gp = cutGeo.attributes.position, gu = cutGeo.attributes.uv, gi = cutGeo.index;
   const vIsland = new Int32Array(gp.count);
   for (let v = 0; v < gp.count; v++) {
-    const mx = Math.max(0, Math.min(mw - 1, Math.round(gu.getX(v) * mw)));
-    const my = Math.max(0, Math.min(mh - 1, Math.round(gu.getY(v) * mh)));
+    const mx = THREE.MathUtils.clamp(Math.round(gu.getX(v) * mw), 0, mw - 1);
+    const my = THREE.MathUtils.clamp(Math.round(gu.getY(v) * mh), 0, mh - 1);
     vIsland[v] = island[my * mw + mx];
   }
   const byIsland = Array.from({ length: islands }, () => []);
@@ -413,7 +416,7 @@ function buildScatter(aspect, h, unit) {
   // canopy-wide bulge (GUI "canopy bulge"), mirrored from the plane's own vertex shader so the dots sit
   // on the same surface: a radially symmetric bump centered on the plane's origin, smoothstep falloff to
   // 0 by BULGE_R * unit out
-  const bulgeZ = (wx, wy) => { const t = Math.min(1, Math.hypot(wx, wy) / (BULGE_R * unit)); return -ui.bulge * (1 - t * t * (3 - 2 * t)); };
+  const bulgeZ = (wx, wy) => -ui.bulge * (1 - THREE.MathUtils.smoothstep(Math.hypot(wx, wy), 0, BULGE_R * unit));
   // ui.instances counts dots over the window-sized part of the canopy; the rest of the plane gets
   // proportionally more, so on-screen density doesn't depend on the plane's shape
   const nWant = Math.min(scatter.instanceMatrix.count, Math.round(ui.instances * mw * mh / (upx * upx * camera.aspect)));
@@ -489,7 +492,7 @@ function buildScatter(aspect, h, unit) {
   trunkGroup.children.forEach((t) => t.geometry.dispose());
   trunkGroup.clear();
   const e = scatter.instanceMatrix.array;
-  const ja = ui.jointAngle * Math.PI / 180;
+  const ja = THREE.MathUtils.degToRad(ui.jointAngle);
   // canopy surface: the highest dot covering each cell of a world-space xy grid, read straight off the
   // placed dots (their world xy already carries the k pull-in, so no mask lookup can get it right).
   // Cells touching a dot's disc at all count as covered
@@ -562,7 +565,7 @@ function buildScatter(aspect, h, unit) {
       // keep the branch in front of the canopy: one point per ring, each pushed toward the camera until its
       // tube clears the bowl surface under it, tip included (so it sits in front of its dot instead of
       // piercing it). Ring 0 stays put: a lateral's base has to stay on its parent
-      const radii = Array.from({ length: segs + 1 }, (_, j) => r0 * (1 + (ui.tipTaper - 1) * j / segs));
+      const radii = Array.from({ length: segs + 1 }, (_, j) => taperAt(r0, j / segs));
       const ringPts = Array.from({ length: segs + 1 }, (_, j) => noisy.getPointAt(j / segs));
       // each ring's clearance target, dilated over its immediate neighbors (radius 1) so one ring under an
       // isolated tall dot doesn't kink on its own: a hard per-ring clamp reads as a sideways zigzag under the
@@ -577,27 +580,26 @@ function buildScatter(aspect, h, unit) {
       const own = tips[set[0]], ang = (k) => Math.atan2(tips[k].y - own.y, tips[k].x - own.x), rest = set.slice(1).sort((p, q) => ang(p) - ang(q));
       const L = Math.min(rest.length, LAT_MAX), groups = Array.from({ length: L }, (_, g) => rest.slice(Math.round(g * rest.length / L), Math.round((g + 1) * rest.length / L)));
       const center = (g) => g.reduce((s, k) => s.add(tips[k]), new THREE.Vector3()).divideScalar(g.length);
-      groups.sort((p, q) => center(q).distanceTo(own) - center(p).distanceTo(own));   // farthest first: lowest on the branch
+      const centers = new Map(groups.map((g) => [g, center(g)]));
+      groups.sort((p, q) => centers.get(q).distanceTo(own) - centers.get(p).distanceTo(own));   // farthest first: lowest on the branch
       const G = Math.ceil(L / ui.whorls);
       groups.forEach((g, gi) => {
-        const c = center(g);
+        const c = centers.get(g);
         g.sort((p, q) => tips[p].distanceTo(c) - tips[q].distanceTo(c));   // the lateral's own tip: its group's anchor nearest the group's center
         const t = span[0] + (span[1] - span[0]) * (G > 1 ? Math.floor(gi / ui.whorls) / (G - 1) : 0);
         const P = curve.getPointAt(t), T = curve.getTangentAt(t), v = c.clone().sub(P), side = v.clone().projectOnPlane(T).normalize();
         const d = T.clone().multiplyScalar(Math.cos(ja)).addScaledVector(side, Math.sin(ja)), A = tips[g[0]], len = A.distanceTo(P);
         // one smooth bend: out along the joint angle, then straight on to the tip (no jittered midpoint, which twisted it)
-        grow(g, [P, P.clone().addScaledVector(d, .3 * len), A.clone()], bi, Math.round(t * segs), [.35, .8], .9 * r0 * (1 + (ui.tipTaper - 1) * t));
+        grow(g, [P, P.clone().addScaledVector(d, .3 * len), A.clone()], bi, Math.round(t * segs), [.35, .8], .9 * taperAt(r0, t));
       });
     };
     // the leader: a straight lean from its base near the camera to the center anchor, its lowest lateral at
-    // a random height above the canopy, its highest just under it. ui.trunkAngle adds extra lean on top of
+    // ui.forkStart plus a random spread along it, its highest just under the canopy. ui.trunkAngle adds extra lean on top of
     // the shared-circle radius: a real angle from vertical, in the same crown direction, via the base's
     // height above its own tip (so it composes with baseR instead of replacing it)
     const lean = baseR + Math.tan(THREE.MathUtils.degToRad(ui.trunkAngle)) * (TRUNK_END_Z - tips[0].z);
     const base = new THREE.Vector3(mid.x / midLen * lean, mid.y / midLen * lean, TRUNK_END_Z), z2t = (z) => (TRUNK_END_Z - z) / (TRUNK_END_Z - tips[0].z);
-    // the lowest lateral's t is picked directly (not from a world-z height above the canopy, which used
-    // to drift with TRUNK_END_Z/unit and push the fork almost up to the tip on a longer leader)
-    grow([...tips.keys()], [base, tips[0].clone()], -1, 0, [ui.forkStart + THREE.MathUtils.seededRandom() * TRUNK_FORK_SPREAD, z2t(zb + .015 * unit)], Infinity);
+    grow([...tips.keys()], [base, tips[0].clone()], -1, 0, [ui.forkStart + THREE.MathUtils.seededRandom() * TRUNK_FORK_SPREAD, z2t(zb + FORK_TOP_GAP * unit)], Infinity);
     const g = new THREE.BufferGeometry();
     g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
     g.setAttribute('normal', new THREE.Float32BufferAttribute(nrm, 3));
