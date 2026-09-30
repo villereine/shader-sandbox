@@ -77,6 +77,7 @@ const taperAt = (r, t) => r * (1 + (ui.tipTaper - 1) * t);   // branch radius at
 const TRUNK_FORK_SPREAD = .15;    // the lowest lateral's fork point is ui.forkStart plus up to this much further along the leader (0 base, 1 canopy)
 const TRUNK_NOISE_SCALE = .4;     // the leader gets this fraction of ui.noise; laterals get the full amount
 const BRANCH_REACH = .75;         // anchors spread over a disk this fraction of the island's radius around its centroid
+const CANOPY_SMOOTH = 3;         // radius (canopy grid cells) the height map the branches ride is smoothed over
 const TIP_CLEARANCE = .04;       // gap (world units) between a branch's surface and the canopy it passes over or ends at
 const LAT_MAX = 4;               // most laterals one branch grows; more tips than that are grouped, and each group branches again
 const TRUNK_SEGS = 32, BRANCH_SEGS = 12, TRUNK_RADIAL = 8;   // rings along a leader / a lateral, segments around each ring
@@ -497,13 +498,29 @@ function buildScatter(aspect, h, unit) {
   // placed dots (their world xy already carries the k pull-in, so no mask lookup can get it right).
   // Cells touching a dot's disc at all count as covered
   const CZ = .05, gx0 = -h * aspect / 2, gy0 = -h / 2, gw = Math.ceil(h * aspect / CZ), gh = Math.ceil(h / CZ);
-  const canopyTop = new Float32Array(gw * gh);
+  const rawTop = new Float32Array(gw * gh);
   for (let i = 0; i < count; i++) {
     const X = e[i * 16 + 12], Y = e[i * 16 + 13], Z = e[i * 16 + 14], R = e[i * 16] / 2 + CZ * .71;
     for (let cy = Math.max(0, Math.floor((Y - R - gy0) / CZ)); cy <= Math.min(gh - 1, Math.floor((Y + R - gy0) / CZ)); cy++)
       for (let cx = Math.max(0, Math.floor((X - R - gx0) / CZ)); cx <= Math.min(gw - 1, Math.floor((X + R - gx0) / CZ)); cx++)
-        if (Math.hypot((cx + .5) * CZ + gx0 - X, (cy + .5) * CZ + gy0 - Y) < R) canopyTop[cy * gw + cx] = Math.max(canopyTop[cy * gw + cx], Z);
+        if (Math.hypot((cx + .5) * CZ + gx0 - X, (cy + .5) * CZ + gy0 - Y) < R) rawTop[cy * gw + cx] = Math.max(rawTop[cy * gw + cx], Z);
   }
+  // smooth upper envelope: a max filter then a box blur of the same radius, so every cell stays >= its raw
+  // height (each cell the blur averages is within the dilation radius of it) but the surface the branches
+  // ride no longer jumps from dot to dot, which read as zigzags on thin branches
+  const sweep = (src, horiz, max) => {
+    const out = new Float32Array(src.length), len = horiz ? gw : gh, lines = horiz ? gh : gw;
+    for (let l = 0; l < lines; l++) for (let i = 0; i < len; i++) {
+      let m = 0, s = 0;
+      for (let d = -CANOPY_SMOOTH; d <= CANOPY_SMOOTH; d++) {
+        const j = Math.min(len - 1, Math.max(0, i + d)), v = src[horiz ? l * gw + j : j * gw + l];
+        m = Math.max(m, v); s += v;
+      }
+      out[horiz ? l * gw + i : i * gw + l] = max ? m : s / (2 * CANOPY_SMOOTH + 1);
+    }
+    return out;
+  };
+  const canopyTop = sweep(sweep(sweep(sweep(rawTop, true, true), false, true), true, false), false, false);
   const canopyZ = (X, Y, r) => {   // highest canopy anywhere under a tube ring of radius r centered at (X, Y)
     let z = 0;
     for (let cy = Math.max(0, Math.floor((Y - r - gy0) / CZ)); cy <= Math.min(gh - 1, Math.floor((Y + r - gy0) / CZ)); cy++)
@@ -567,12 +584,14 @@ function buildScatter(aspect, h, unit) {
       // piercing it). Ring 0 stays put: a lateral's base has to stay on its parent
       const radii = Array.from({ length: segs + 1 }, (_, j) => taperAt(r0, j / segs));
       const ringPts = Array.from({ length: segs + 1 }, (_, j) => noisy.getPointAt(j / segs));
-      // each ring's clearance target, dilated over its immediate neighbors (radius 1) so one ring under an
-      // isolated tall dot doesn't kink on its own: a hard per-ring clamp reads as a sideways zigzag under the
-      // perspective camera, since a ring pushed closer to the camera also shifts outward in screen space
+      // each ring's clearance target, smoothed: a hard per-ring clamp reads as a sideways zigzag under the
+      // perspective camera, since a ring pushed closer to the camera also shifts outward in screen space.
+      // Dilate by 2 rings, then blur with [1 2 1] / 4: every ring's blurred value is still >= its own
+      // requirement (each neighbor's dilated value covers it), so clearance holds and the push ramps in
       const req = ringPts.map((p, j) => (j ? canopyZ(p.x, p.y, radii[j]) + radii[j] + TIP_CLEARANCE : -Infinity));
+      const wide = req.map((_, j) => Math.max(...req.slice(Math.max(1, j - 2), j + 3)));
       const curve = new THREE.CatmullRomCurve3(ringPts.map((p, j) => {
-        if (j) p.z = Math.max(p.z, req[j - 1], req[j], j < segs ? req[j + 1] : -Infinity);
+        if (j) p.z = Math.max(p.z, (wide[Math.max(1, j - 1)] + 2 * wide[j] + wide[Math.min(segs, j + 1)]) / 4);
         return p;
       }));
       br.push({ v0: pos.length / 3, segs, parent, jr, tip: set[0], ro: new Float64Array((segs + 1) * 3) });   // ro: ring offsets, filled in tick()
@@ -657,10 +676,25 @@ function buildScatter(aspect, h, unit) {
   }
   // no crack walls: the distance field is the crack at rest, and it stops lining up with the land
   // as soon as the mesh bends
+  // per-island sleep bookkeeping for tick(): dots are grouped by island (counting sort above) and links are
+  // listed in dot order, so each island owns one contiguous dot range dS[a]..dS[a+1] and link range
+  // lS[a]..lS[a+1]. bound[a]: how far its dots reach from its rigid center at rest. quiet[a]: frames since
+  // anything there moved. mv[a]: its dots' largest move last step. wob[a]: its satellites' largest wobble.
+  // runs: the awake islands' ranges for this frame, see stepDots
+  const dS = new Int32Array(islands + 1), lS = new Int32Array(islands + 1), bound = new Float32Array(islands);
+  for (let i = 0; i < n; i++) {
+    const a = isl[i];
+    dS[a + 1]++;
+    bound[a] = Math.max(bound[a], Math.hypot(hx[i] - isles.hx[a], hy[i] - isles.hy[a]) + r[i]);
+  }
+  for (let l = 0; l < la.length; l++) lS[isl[la[l]] + 1]++;
+  for (let a = 0; a < islands; a++) { dS[a + 1] += dS[a]; lS[a + 1] += lS[a]; }
   dots = {
     ...makeBody(hx, hy, r, la, lb, lux, luy, rest, mw, mh, upx),
     k: kAll.slice(0, n), isl: isl.slice(0, n),
     h, aspect, rv, rw, workHx: new Float32Array(n), workHy: new Float32Array(n),   // per-dot spring target, refilled each frame in tick()
+    dS, lS, bound, maxR, quiet: new Int32Array(islands), mv: new Float32Array(islands), wob: new Float32Array(islands),
+    runs: new Int32Array(1 + 5 * islands),
   };
   // cached view stepDots reads for the dots pass in tick(): hx/hy swapped for the per-frame spring
   // target. workHx/workHy are mutated in place each frame (never reallocated), so this stays valid
@@ -683,18 +717,24 @@ const physSats = { cursor: IS_TOUCH ? .015 : .045, push: 1, spring: .005, dampin
 // links. p: phys-shaped params (passed in so the dev self-check can use its own). Returns the
 // largest per-particle move in the last substep, in px, for the sleep test
 function stepDots(s, mx, my, p) {
-  const { n, x, y, px, py, sx0, sy0, hx, hy, r, m, la, lb, ux, uy, rest, upx } = s, cr = p.cursor * upx;
+  const { n, x, y, px, py, sx0, sy0, hx, hy, r, m, la, lb, ux, uy, rest, upx, runs } = s, cr = p.cursor * upx;
+  // runs (the dots only): Int32Array [count, then count x (dot start, dot end, link start, link end, island)],
+  // the awake islands this frame, refilled in place by tick(). Without it the whole body is one run
+  const nr = runs ? runs[0] : 1;
   let moved = 0;
   for (let sub = 0; sub < 2; sub++) {
-    for (let i = 0; i < n; i++) {
-      sx0[i] = x[i]; sy0[i] = y[i];   // position before this substep's forces, for the moved measure
-      const vx = (x[i] - px[i]) * p.damping, vy = (y[i] - py[i]) * p.damping;
-      x[i] += vx + (hx[i] - x[i]) * p.spring;
-      y[i] += vy + (hy[i] - y[i]) * p.spring;
-      const dx = x[i] - mx, dy = y[i] - my, dd = dx * dx + dy * dy, reach = cr + r[i];
-      if (dd < reach * reach) {   // inside the cursor ball: move out toward its surface
-        const d = Math.sqrt(dd) || 1e-6, t = (reach - d) / d * p.push;
-        x[i] += dx * t; y[i] += dy * t;
+    for (let q = 0; q < nr; q++) {
+      const i0 = runs ? runs[1 + q * 5] : 0, i1 = runs ? runs[2 + q * 5] : n;
+      for (let i = i0; i < i1; i++) {
+        sx0[i] = x[i]; sy0[i] = y[i];   // position before this substep's forces, for the moved measure
+        const vx = (x[i] - px[i]) * p.damping, vy = (y[i] - py[i]) * p.damping;
+        x[i] += vx + (hx[i] - x[i]) * p.spring;
+        y[i] += vy + (hy[i] - y[i]) * p.spring;
+        const dx = x[i] - mx, dy = y[i] - my, dd = dx * dx + dy * dy, reach = cr + r[i];
+        if (dd < reach * reach) {   // inside the cursor ball: move out toward its surface
+          const d = Math.sqrt(dd) || 1e-6, t = (reach - d) / d * p.push;
+          x[i] += dx * t; y[i] += dy * t;
+        }
       }
     }
     // links push apart along their fixed rest direction u, never along the current a->b line: the
@@ -702,32 +742,45 @@ function stepDots(s, mx, my, p) {
     // and home is the only resting state. Pushing along a->b instead can hold two dots that swapped
     // places in the swapped order against their springs, a permanent jam
     for (let it = 0; it < LINK_PASSES; it++) {
-      for (let l = 0; l < la.length; l++) {
-        const a = la[l], b = lb[l], sep = (x[b] - x[a]) * ux[l] + (y[b] - y[a]) * uy[l];
-        if (sep >= rest[l]) continue;
-        const w = (rest[l] - sep) / (m[a] + m[b]);   // split by mass (r²)
-        x[a] -= ux[l] * w * m[b]; y[a] -= uy[l] * w * m[b];
-        x[b] += ux[l] * w * m[a]; y[b] += uy[l] * w * m[a];
+      for (let q = 0; q < nr; q++) {
+        const l0 = runs ? runs[3 + q * 5] : 0, l1 = runs ? runs[4 + q * 5] : la.length;
+        for (let l = l0; l < l1; l++) {
+          const a = la[l], b = lb[l], sep = (x[b] - x[a]) * ux[l] + (y[b] - y[a]) * uy[l];
+          if (sep >= rest[l]) continue;
+          const w = (rest[l] - sep) / (m[a] + m[b]);   // split by mass (r²)
+          x[a] -= ux[l] * w * m[b]; y[a] -= uy[l] * w * m[b];
+          x[b] += ux[l] * w * m[a]; y[b] += uy[l] * w * m[a];
+        }
       }
     }
     // px/py capture position after this substep's push AND links settle: next substep's velocity
     // is (new x - px), so a push's snap is a reposition, not an impulse, and doesn't get carried
     // forward as momentum. Without this, a particle the cursor shoves hard (e.g. passing almost
     // exactly over it, d near 0) keeps drifting for several frames after, decaying only by p.damping
-    for (let i = 0; i < n; i++) { px[i] = x[i]; py[i] = y[i]; }
+    for (let q = 0; q < nr; q++) {
+      const i0 = runs ? runs[1 + q * 5] : 0, i1 = runs ? runs[2 + q * 5] : n;
+      for (let i = i0; i < i1; i++) { px[i] = x[i]; py[i] = y[i]; }
+    }
   }
-  for (let i = 0; i < n; i++) moved = Math.max(moved, Math.abs(x[i] - sx0[i]) + Math.abs(y[i] - sy0[i]));
+  for (let q = 0; q < nr; q++) {
+    const i0 = runs ? runs[1 + q * 5] : 0, i1 = runs ? runs[2 + q * 5] : n;
+    let mq = 0;
+    for (let i = i0; i < i1; i++) mq = Math.max(mq, Math.abs(x[i] - sx0[i]) + Math.abs(y[i] - sy0[i]));
+    if (runs) s.mv[runs[5 + q * 5]] = mq;   // per island, for tick()'s sleep test
+    moved = Math.max(moved, mq);
+  }
   return moved;
 }
 
 // write dot positions into the instance matrices' translation (scale never changes),
 // same mapping as placement in buildScatter
 function writeDots(s) {
-  const a = scatter.instanceMatrix.array;
-  for (let i = 0; i < s.n; i++) {
-    a[i * 16 + 12] = (s.x[i] / s.mw - .5) * s.h * s.aspect * s.k[i];
-    a[i * 16 + 13] = (s.y[i] / s.mh - .5) * s.h * s.k[i];
-  }
+  const a = scatter.instanceMatrix.array, { runs } = s, nr = runs[0];   // only the awake islands' dots moved
+  for (let q = 0; q < nr; q++)
+    for (let i = runs[1 + q * 5], i1 = runs[2 + q * 5]; i < i1; i++) {
+      a[i * 16 + 12] = (s.x[i] / s.mw - .5) * s.h * s.aspect * s.k[i];
+      a[i * 16 + 13] = (s.y[i] / s.mh - .5) * s.h * s.k[i];
+    }
   // the InstancedMesh is sized for the widest aspect (SCATTER_MAX * 3); without an explicit range,
   // needsUpdate re-uploads that whole oversized buffer every frame instead of just the s.n dots in play
   scatter.instanceMatrix.addUpdateRange(0, s.n * 16);
@@ -765,7 +818,11 @@ function tick() {
   const { sIsl, ldx, ldy } = sats;
   for (let j = 0; j < sats.n; j++) { sats.workHx[j] = sats.hx[j] + offX[sIsl[j]]; sats.workHy[j] = sats.hy[j] + offY[sIsl[j]]; }
   moved = Math.max(moved, stepDots(sats.spring, cursor.x, cursor.y, physSats));
-  for (let j = 0; j < sats.n; j++) { ldx[j] = sats.x[j] - sats.workHx[j]; ldy[j] = sats.y[j] - sats.workHy[j]; }
+  const wob = dots.wob.fill(0);
+  for (let j = 0; j < sats.n; j++) {
+    ldx[j] = sats.x[j] - sats.workHx[j]; ldy[j] = sats.y[j] - sats.workHy[j];
+    wob[sIsl[j]] = Math.max(wob[sIsl[j]], Math.abs(ldx[j]) + Math.abs(ldy[j]));
+  }
   // skin the cut mesh: vertex = home + its center's offset + weighted satellite wobble. vx/vy feed the
   // dots' spring target below regardless, but the mesh itself (plane's islandGroup, layer 0) only shows
   // with "show shader" on -- off by default -- so the write into its position buffer + GPU reupload is
@@ -783,15 +840,30 @@ function tick() {
   // dent carries its dots along while they keep their own cursor push and links. dots.spring is a
   // cached view onto dots with hx/hy swapped for workHx/workHy (built once in buildScatter);
   // workHx/workHy are refilled below in place, so the cached view stays valid
-  const { rv, rw } = dots;
-  for (let i = 0; i < dots.n; i++) {
-    let ox = 0, oy = 0;
-    for (let c = i * 4; c < i * 4 + 4; c++) {
-      const p = rv[c];
-      if (p >= 0) { ox += rw[c] * (vx[p] - vhx[p]); oy += rw[c] * (vy[p] - vhy[p]); }
+  // Only islands that are awake step: one that has been still for 30 frames, with nothing moving its
+  // center or satellites and the cursor nowhere near, stays put (its dots rest where they are). An island
+  // is near the cursor when the ball reaches its dots' bounding circle around its (moving) center, padded
+  // by its satellites' wobble
+  const { rv, rw, dS, lS, runs, quiet, mv, bound } = dots, reach = phys.cursor * dots.upx + dots.maxR;
+  let nr = 0;
+  for (let a = 0; a < isles.n; a++) {
+    if (dS[a] === dS[a + 1]) continue;
+    const near = Math.hypot(cursor.x - isles.x[a], cursor.y - isles.y[a]) < bound[a] + wob[a] + reach;
+    quiet[a] = near || mv[a] > .02 || Math.abs(offX[a]) + Math.abs(offY[a]) + wob[a] > .02 ? 0 : quiet[a] + 1;
+    if (quiet[a] >= 30) continue;
+    runs.set([dS[a], dS[a + 1], lS[a], lS[a + 1], a], 1 + nr++ * 5);
+  }
+  runs[0] = nr;
+  for (let q = 0; q < nr; q++) {
+    for (let i = runs[1 + q * 5], i1 = runs[2 + q * 5]; i < i1; i++) {
+      let ox = 0, oy = 0;
+      for (let c = i * 4; c < i * 4 + 4; c++) {
+        const p = rv[c];
+        if (p >= 0) { ox += rw[c] * (vx[p] - vhx[p]); oy += rw[c] * (vy[p] - vhy[p]); }
+      }
+      dots.workHx[i] = dots.hx[i] + ox;
+      dots.workHy[i] = dots.hy[i] + oy;
     }
-    dots.workHx[i] = dots.hx[i] + ox;
-    dots.workHy[i] = dots.hy[i] + oy;
   }
   moved = Math.max(moved, stepDots(dots.spring, cursor.x, cursor.y, phys));
   writeDots(dots);
