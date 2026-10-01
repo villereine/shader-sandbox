@@ -4,22 +4,23 @@ import GUI from 'three/examples/jsm/libs/lil-gui.module.min.js';
 import Stats from 'three/examples/jsm/libs/stats.module.js';
 import crack from './crack.glsl.js';
 
-const DIST = 3;         // camera distance; the background plane is sized to fill the window at this distance
+const DIST = 3;         // canopy sizing distance: the plane is sized to fill the window seen from this distance
+const CAM_Z = 4.5;      // build-time sizing reference for the mask density and dot lift (DIST + 1 put the canopy inside the view with sky around it); the camera's own starting z is set separately below and can drift from this
 const MARGIN = 1.25;    // plane oversize factor so edges don't show on resize or orbit
+const START_Z = 7;    // the camera's starting z (GUI "cam z"); PLANE_SCALE and TRUNK_END_Z follow it
+const PLANE_SCALE = START_Z / (DIST * MARGIN);    // desktop canopy side beyond the window's long side; sizes (unit) don't change, so it adds area.
+                             // = START_Z / (DIST * MARGIN) so the square canopy (sized off DIST) still covers
+                             // the window's x axis at the camera's starting z, which sits farther back than DIST
 const SEED = [Math.random() * 100, Math.random() * 100];   // random per page load; hardcode for a reproducible layout
 const IS_TOUCH = matchMedia('(hover: none) and (pointer: coarse)').matches;
 
-const SCATTER_N = 19000;     // instances to place (default for the GUI slider)
-const SCATTER_MAX = 20000;   // InstancedMesh capacity, and the GUI slider's max
+const SCATTER_N = 5000;   // instances to place (default for the GUI slider)
+const SCATTER_MAX = 20000;   // the GUI slider's max (dots over the window-sized part of the canopy)
 const SCATTER_LIFT = .02;    // z-offset above the shader plane so instances don't z-fight it
-const SCATTER_DEPTH = .15;   // random extra height on top of SCATTER_LIFT, world units (typical dot ~.045 across)
+const BULGE_R = .9;          // radius (fraction of unit) the canopy bulge (GUI "canopy bulge") falls off to 0 over
 const SCATTER_SHADE = .7;    // how far the highest dots blend toward SCATTER_SHADOW (0 = no shading)
 const SCATTER_SHADOW = new THREE.Color(0x531745);   // shadow color the high dots blend toward
-const SCATTER_MIN_SIZE = .3; // smallest an instance may shrink to fit beside a crack (fraction of base size);
-                              // spots too tight even for that are skipped
 const SCATTER_BASE_SIZE = .013; // typical (median) instance size, as a fraction of plane height
-const SCATTER_SIZE_VAR = .25; // log-normal size spread (GUI default); 0 = all one size, .25 = roughly
-                              // 0.6x to 1.65x the typical size at the 2-sigma clamp
 const SCATTER_FALLOFF = .03; // distance from a crack (fraction of plane height) over which density ramps
                               // from SCATTER_MIN_DENSITY up to full
 const SCATTER_MIN_DENSITY = .05; // placement probability right at a crack edge (fraction of full density)
@@ -48,42 +49,71 @@ document.body.appendChild(renderer.domElement);
 
 const scene = new THREE.Scene();
 scene.background = new THREE.Color(0x91b4c9);
-const camera = new THREE.PerspectiveCamera(50, innerWidth / innerHeight, .1, 100);
-camera.position.set(0, 0, DIST);
+const camera = new THREE.PerspectiveCamera(90, innerWidth / innerHeight, .1, 100);
+camera.position.set(0, 0, START_Z);   // starting zoom (GUI "cam z"): independent of CAM_Z, which stays the build-time sizing reference
 const controls = new OrbitControls(camera, renderer.domElement);
 if (IS_TOUCH) controls.enabled = false;   // lock camera on touch devices; finger still pushes dots via pointermove
 
-const SEGS = 50;   // wireframe subdivisions along the plane's shorter side; the longer side gets
-                    // SEGS * aspect (recomputed in resize()) so each cell stays square on screen
-                    // instead of stretching with the window
-const ISLAND_CUT_SEGS = 120;   // resolution of the per-island cut-mesh grid, independent of the
-                                // debug wireframe's SEGS; a finer grid traces the crack gap more closely
+const ISLAND_CUT_SEGS = 120;   // resolution of the per-island cut-mesh grid; a finer grid traces the crack gap more closely
 const CENTER_R_SCALE = .3;   // island center's physics radius (cursor reach, mass) as a fraction of the island's
                               // own radius sqrt(area / pi); at 1 one hover reached several islands at once
 const ISLAND_SATS = 10;      // satellites per island (fewer on tiny islands); more = sharper dents, more cost
 const SAT_INSET = .7;        // satellites sit this fraction of the way from the centroid out to the rim point they were sampled at
 const SAT_SIGMA = .7;        // skin-weight falloff, as a fraction of the island's per-satellite radius sqrt(area / sats)
 
-const plane = new THREE.Mesh(new THREE.PlaneGeometry(1, 1, SEGS, SEGS), new THREE.ShaderMaterial({
+// trees: per island, one lit, tapered mesh. A leader climbs from the camera side (+z) to the
+// island's center; laterals leave it at the joint angle (ui.jointAngle, ui.whorls per
+// growth point, after florasynth.com/docs/branching) and curve to the other anchors, branching again the
+// same way. The mesh and both lights sit on layer 1: maskCam (layer 0) must not draw trees into the
+// placement mask, and three.js layer-tests lights too, while the main camera drops layer 0 whenever
+// "show shader" is off
+const TRUNK_END_Z = START_Z + .3;   // z of each leader's base, just past the camera's starting z so the far ends stay out of view
+const FORK_TOP_GAP = .015;   // the highest lateral's fork sits this far (fraction of unit) above the canopy under the tree
+const taperAt = (r, t) => r * (1 + (ui.tipTaper - 1) * t);   // branch radius at fraction t of its length, from base radius r
+const TRUNK_FORK_SPREAD = .15;    // the lowest lateral's fork point is ui.forkStart plus up to this much further along the leader (0 base, 1 canopy)
+const TRUNK_NOISE_SCALE = .4;     // the leader gets this fraction of ui.noise; laterals get the full amount
+const BRANCH_REACH = .75;         // anchors spread over a disk this fraction of the island's radius around its centroid
+const CANOPY_SMOOTH = 3;         // radius (canopy grid cells) the height map the branches ride is smoothed over
+const TIP_CLEARANCE = .04;       // gap (world units) between a branch's surface and the canopy it passes over or ends at
+const LAT_MAX = 4;               // most laterals one branch grows; more tips than that are grouped, and each group branches again
+const TRUNK_SEGS = 32, BRANCH_SEGS = 12, TRUNK_RADIAL = 8;   // rings along a leader / a lateral, segments around each ring
+const trunkMat = new THREE.MeshLambertMaterial({ color: 0x590307 });   // trunk color: dark red-brown
+const trunkGroup = new THREE.Group();
+const ambient = new THREE.AmbientLight(0xffffff, 1), sun = new THREE.DirectionalLight(0xffffff, 2);
+sun.position.set(-2, 3, 4);   // upper left, in front
+ambient.layers.set(1);
+sun.layers.set(1);
+scene.add(trunkGroup, ambient, sun);
+
+const plane = new THREE.Mesh(new THREE.PlaneGeometry(), new THREE.ShaderMaterial({
   uniforms: {
     seed: { value: new THREE.Vector2(...SEED) },
-    patternScale: { value: IS_TOUCH ? .5 : .75 },
-    patternRatio: { value: 1 },
-    zebraAmp: { value: 1.04 },   // see crack.glsl.js
-    noiseFreq: { value: .7 },
+    patternScale: { value: IS_TOUCH ? .5 : 1.3 },
+    patternUnit: { value: 1 },   // world height of a window-filling plane (resize()), so cell size doesn't follow the square plane's size
+    patternRatio: { value: 1.05 },
+    zebraAmp: { value: .64 },   // see crack.glsl.js
+    noiseFreq: { value: 1.35 },
     widthMin: { value: 1 },   // crack line half-width range, in pixels; see crack.glsl.js
     widthMax: { value: 1 },
+    bulgeDepth: { value: 0 },   // GUI "canopy bulge": peak height of the canopy-wide bulge, world units
   },
-  // uv -> pattern space (2 units = plane height at patternScale 1; higher = bigger cells), aspect
-  // taken from the plane's own scale
+  // uv -> pattern space (2 units = patternUnit at patternScale 1; higher = bigger cells), sized from
+  // the plane's own world scale
   vertexShader: /* glsl */ `
-    uniform float patternScale, patternRatio;
+    uniform float patternScale, patternRatio, patternUnit, bulgeDepth;
     varying vec2 vUv;
     void main() {
+      // canopy bulge first, before anything else: radially symmetric bump centered on the plane's
+      // own origin, in world units (patternUnit = unit), falling smoothly to 0 by BULGE_R * unit out.
+      // buildScatter() mirrors this in JS (bulgeZ()) so the scatter dots sit on the same surface
+      vec2 worldXy = position.xy * vec2(length(modelMatrix[0].xyz), length(modelMatrix[1].xyz));
+      float distT = min(1., length(worldXy) / (${BULGE_R} * patternUnit));
+      float bulgeW = 1. - distT * distT * (3. - 2. * distT);   // smoothstep falloff: 1 at center, 0 at the rim
+      vec3 displaced = position + vec3(0., 0., -bulgeDepth * bulgeW);
       // patternRatio > 1 stretches cells wider, < 1 taller; area-preserving, so the cell count holds
-      vUv = uv * vec2(length(modelMatrix[0].xyz) / length(modelMatrix[1].xyz), 1.) * 2. / patternScale
+      vUv = uv * vec2(length(modelMatrix[0].xyz), length(modelMatrix[1].xyz)) / patternUnit * 2. / patternScale
           * vec2(inversesqrt(patternRatio), sqrt(patternRatio));
-      gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.);
+      gl_Position = projectionMatrix * modelViewMatrix * vec4(displaced, 1.);
     }`,
   fragmentShader: /* glsl */ `
     ${crack}
@@ -104,14 +134,6 @@ const plane = new THREE.Mesh(new THREE.PlaneGeometry(1, 1, SEGS, SEGS), new THRE
 }));
 scene.add(plane);
 
-// wireframe overlay, off by default -- press F to toggle
-const wireframe = new THREE.LineSegments(
-  new THREE.WireframeGeometry(plane.geometry),
-  new THREE.LineBasicMaterial({ color: 0x000000, transparent: true, opacity: .3 }),
-);
-wireframe.visible = false;
-plane.add(wireframe);   // child of plane: inherits its scale/position automatically
-
 // --- colored dots scattered over the "land" (non-crack) area, random sizes, shrunk near a crack
 // edge. Flat in the plane's own surface (not billboarded to the
 // camera), true circles on screen. NOT a child of `plane`: plane.scale is non-uniform
@@ -120,16 +142,17 @@ plane.add(wireframe);   // child of plane: inherits its scale/position automatic
 // re-stretches the already-rotated shape into a parallelogram. So `scatter` is a sibling in the
 // scene instead, and buildScatter() bakes plane's world scale (h*aspect, h) into each instance's
 // position/size by hand, uniformly post-rotation, instead of inheriting it. ---
-const scatterGeo = new THREE.CircleGeometry(.5, 16);   // diameter 1, same footprint as the old unit square
+const scatterGeo = new THREE.CircleGeometry(.5, 12);   // diameter 1, same footprint as the old unit square
 const scatterMat = new THREE.MeshBasicMaterial({ side: THREE.DoubleSide });   // white, tinted per instance by setColorAt
-const scatter = new THREE.InstancedMesh(scatterGeo, scatterMat, SCATTER_MAX);
+const scatter = new THREE.InstancedMesh(scatterGeo, scatterMat, SCATTER_MAX * 3);   // x3: the square canopy's extra area off-screen (up to 3:1 windows)
+scatter.frustumCulled = false;   // three.js computes an InstancedMesh's bounding sphere once; rebuilds (fov, window) and pushes outgrow it
 scene.add(scatter);
 
 // Placement reads back what the shader actually paints: the plane alone, rendered into maskRT by
 // an ortho camera framing it exactly, at on-screen pixel density (crack widths are in pixels, so
 // the density has to match the default view). A CPU copy of the field can't do this: the GPU's
 // float32 sin-hash gives different values than JS float64, so the copy draws other cracks.
-// Instances and the wireframe live on layer 1, which maskCam doesn't render. The mask uses
+// Instances live on layer 1, which maskCam doesn't render. The mask uses
 // maskMat, which swaps the per-pixel random crack width for SCATTER_EDGE (see MASK_Q in
 // crack.glsl.js), so the speckles around each crack count as land.
 const maskMat = plane.material.clone();
@@ -139,7 +162,6 @@ const maskCam = new THREE.OrthographicCamera();
 maskCam.position.z = 1;
 const maskRT = new THREE.WebGLRenderTarget(1, 1);
 scatter.layers.set(1);
-wireframe.layers.set(1);
 camera.layers.enable(1);
 
 // exact 1D squared distance transform (Felzenszwalb & Huttenlocher: lower envelope of parabolas),
@@ -161,19 +183,53 @@ function edt1d(g, off, step, n, f, v, z) {
 
 // shared physics-body shape stepDots() operates on: home position (hx/hy, also seeded as the
 // initial x/y/px/py/sx0/sy0 snapshot), radius r, and same-body links (la/lb/ux/uy/rest)
-function makeBody(hx, hy, r, la, lb, ux, uy, rest, mw, mh) {
+// upx (mask px per unit, for cursor sizing) defaults to mh, for the self-check bodies below
+function makeBody(hx, hy, r, la, lb, ux, uy, rest, mw, mh, upx = mh) {
   return {
     n: hx.length, x: hx.slice(), y: hy.slice(), px: hx.slice(), py: hy.slice(), sx0: hx.slice(), sy0: hy.slice(),
     hx, hy, r, m: r.map((v) => v * v),
     la: Int32Array.from(la), lb: Int32Array.from(lb),
     ux: Float32Array.from(ux), uy: Float32Array.from(uy), rest: Float32Array.from(rest),
-    mw, mh,
+    mw, mh, upx,
   };
 }
 
+// appends a tube along `curve` to one tree's arrays: segs + 1 rings of TRUNK_RADIAL + 1 vertices, base
+// first, radius r0 at the base tapering linearly to r1 at the tip. Same layout and winding as TubeGeometry
+function taperTube(curve, segs, r0, r1, pos, nrm, idx) {
+  const { normals, binormals } = curve.computeFrenetFrames(segs, false), base = pos.length / 3, P = new THREE.Vector3();
+  for (let i = 0; i <= segs; i++) {
+    curve.getPointAt(i / segs, P);
+    const r = r0 + (r1 - r0) * i / segs, N = normals[i], B = binormals[i];
+    for (let j = 0; j <= TRUNK_RADIAL; j++) {
+      const a = j / TRUNK_RADIAL * 2 * Math.PI, s = Math.sin(a), c = -Math.cos(a);
+      const nx = c * N.x + s * B.x, ny = c * N.y + s * B.y, nz = c * N.z + s * B.z;
+      nrm.push(nx, ny, nz);
+      pos.push(P.x + r * nx, P.y + r * ny, P.z + r * nz);
+    }
+  }
+  for (let i = 0; i < segs; i++) for (let j = 0; j < TRUNK_RADIAL; j++) {
+    const a = base + i * (TRUNK_RADIAL + 1) + j, b = a + TRUNK_RADIAL + 1;
+    idx.push(a, b, a + 1, b, b + 1, a + 1);
+  }
+}
+
 const _m = new THREE.Matrix4(), _c = new THREE.Color();
-function buildScatter(aspect, h) {
-  const mw = Math.round(renderer.domElement.width * MARGIN), mh = Math.round(renderer.domElement.height * MARGIN);
+// the plane is h * aspect by h world units. unit: the height of a plane that just fills the window (times
+// MARGIN), which every "fraction of plane height" constant is measured against, so a bigger plane
+// doesn't blow up dot size, cursor size or trunk width
+function buildScatter(aspect, h, unit) {
+  // reseed so dot placement, island colors and trees come out identical every rebuild (resize, FOV) for
+  // the same crack seed and the same sequence of seededRandom() calls -- only "new seed" (which rerolls
+  // this uniform) or a slider that changes how many random draws the placement loop makes per candidate
+  // (e.g. "dot scale", which shifts the early-skip below) reshuffles the layout
+  const sv = plane.material.uniforms.seed.value;
+  THREE.MathUtils.seededRandom(sv.x * 1e6 + sv.y);
+  // mask px per world unit: the on-screen density crack widths were tuned at (crack widths are set in
+  // screen px, so the mask has to match it), at CAM_Z -- a fixed sizing reference, not the live camera
+  // position (GUI "cam z", starts at 6 vs CAM_Z's 4.5). unit / MARGIN spans the window height from DIST
+  const ppu = renderer.domElement.height * MARGIN / unit * DIST / CAM_Z;
+  const mw = Math.round(h * aspect * ppu), mh = Math.round(h * ppu), upx = unit * ppu;   // upx: unit in mask px
   Object.assign(maskCam, { left: -h * aspect / 2, right: h * aspect / 2, top: h / 2, bottom: -h / 2 });
   maskCam.updateProjectionMatrix();
   maskRT.setSize(mw, mh);
@@ -212,14 +268,13 @@ function buildScatter(aspect, h) {
   // is dropped, leaving an actual gap instead of a shader-painted line. Every island mesh shares the
   // plane's material and this one grid's position/uv buffers -- uv stays plane-space, so the pattern
   // lines up with no per-island remapping, and only the index (which triangles survive) is per island.
-  const cutSegsX = aspect >= 1 ? Math.round(ISLAND_CUT_SEGS * aspect) : ISLAND_CUT_SEGS;
-  const cutSegsY = aspect >= 1 ? ISLAND_CUT_SEGS : Math.round(ISLAND_CUT_SEGS / aspect);
+  const cutSegsX = Math.round(ISLAND_CUT_SEGS * h * aspect / unit), cutSegsY = Math.round(ISLAND_CUT_SEGS * h / unit);   // square cells, ISLAND_CUT_SEGS per unit
   const cutGeo = new THREE.PlaneGeometry(1, 1, cutSegsX, cutSegsY);
   const gp = cutGeo.attributes.position, gu = cutGeo.attributes.uv, gi = cutGeo.index;
   const vIsland = new Int32Array(gp.count);
   for (let v = 0; v < gp.count; v++) {
-    const mx = Math.max(0, Math.min(mw - 1, Math.round(gu.getX(v) * mw)));
-    const my = Math.max(0, Math.min(mh - 1, Math.round(gu.getY(v) * mh)));
+    const mx = THREE.MathUtils.clamp(Math.round(gu.getX(v) * mw), 0, mw - 1);
+    const my = THREE.MathUtils.clamp(Math.round(gu.getY(v) * mh), 0, mh - 1);
     vIsland[v] = island[my * mw + mx];
   }
   const byIsland = Array.from({ length: islands }, () => []);
@@ -247,7 +302,7 @@ function buildScatter(aspect, h) {
   }
 
   // neighbors: islands facing each other across a crack, i.e. with land pixels less than G apart
-  const G = Math.ceil(.06 * mh), near = Array.from({ length: islands }, () => new Set());
+  const G = Math.ceil(.06 * upx), near = Array.from({ length: islands }, () => new Set());
   for (let y = 0; y < mh - G; y += 2) for (let x = 0; x < mw - G; x += 2) {
     const a = island[y * mw + x], right = island[y * mw + x + G], up = island[(y + G) * mw + x];
     if (a < 0) continue;
@@ -261,7 +316,7 @@ function buildScatter(aspect, h) {
     const palette = SCATTER_PALETTES[paletteIdx];
     const free = palette.filter((c) => ![...near[a]].some((b) => islandColor[b] === c));
     const pick = free.length ? free : palette;
-    islandColor[a] = pick[Math.floor(Math.random() * pick.length)];
+    islandColor[a] = pick[Math.floor(THREE.MathUtils.seededRandom() * pick.length)];
   }
 
   // distance (px) from every pixel to the nearest crack pixel: one exact 2D distance transform,
@@ -320,7 +375,7 @@ function buildScatter(aspect, h) {
     const dx = c0x[b] - c0x[a], dy = c0y[b] - c0y[a], d = Math.hypot(dx, dy) || 1;
     ila.push(a); ilb.push(b); ilux.push(dx / d); iluy.push(dy / d); ilrest.push(d - .01);
   }
-  isles = { ...makeBody(c0x, c0y, ir, ila, ilb, ilux, iluy, ilrest, mw, mh), offX: new Float32Array(islands), offY: new Float32Array(islands) };
+  isles = { ...makeBody(c0x, c0y, ir, ila, ilb, ilux, iluy, ilrest, mw, mh, upx), offX: new Float32Array(islands), offY: new Float32Array(islands) };
 
   // satellites: farthest-point sampling over the island's vertices (seeded at the centroid, so the
   // first pick is the farthest rim point and the rest spread out), then pulled SAT_INSET of the way
@@ -347,39 +402,56 @@ function buildScatter(aspect, h) {
     }
   }
   const ns = shx.length;
-  sats = { ...makeBody(Float32Array.from(shx), Float32Array.from(shy), Float32Array.from(sr), [], [], [], [], [], mw, mh),
+  sats = { ...makeBody(Float32Array.from(shx), Float32Array.from(shy), Float32Array.from(sr), [], [], [], [], [], mw, mh, upx),
     sIsl: Int32Array.from(sIsl), workHx: new Float32Array(ns), workHy: new Float32Array(ns),   // spring target: rest + center offset
     ldx: new Float32Array(ns), ldy: new Float32Array(ns) };   // wobble relative to that target, what the vertices blend
   sats.spring = { ...sats, hx: sats.workHx, hy: sats.workHy };   // cached view, same trick as dots.spring
   verts = { n: nv, hx: Float32Array.from(vhx), hy: Float32Array.from(vhy), x: Float32Array.from(vhx), y: Float32Array.from(vhy), vIsl, vs, vw, pv, gp, mw, mh };
 
-  const full = SCATTER_BASE_SIZE * ui.scale * mh;   // typical (median) instance size, mask px
-  const R = SCATTER_FALLOFF * mh;   // density-ramp width, mask px
-  // per-dot physics data, filled as dots are placed: home (mask px), radius, depth factor, island
-  const hxAll = new Float32Array(ui.instances), hyAll = new Float32Array(ui.instances);
-  const rAll = new Float32Array(ui.instances), kAll = new Float32Array(ui.instances), isl = new Int32Array(ui.instances);
+  const full = SCATTER_BASE_SIZE * ui.scale * upx;   // typical (median) instance size, mask px
+  const R = SCATTER_FALLOFF * upx;   // density-ramp width, mask px
+  // canopy-wide bulge (GUI "canopy bulge"), mirrored from the plane's own vertex shader so the dots sit
+  // on the same surface: a radially symmetric bump centered on the plane's origin, smoothstep falloff to
+  // 0 by BULGE_R * unit out
+  const bulgeZ = (wx, wy) => -ui.bulge * (1 - THREE.MathUtils.smoothstep(Math.hypot(wx, wy), 0, BULGE_R * unit));
+  // ui.instances counts dots over the window-sized part of the canopy; the rest of the plane gets
+  // proportionally more, so on-screen density doesn't depend on the plane's shape
+  const nWant = Math.min(scatter.instanceMatrix.count, Math.round(ui.instances * mw * mh / (upx * upx * camera.aspect)));
+  // per-dot physics data, filled as dots are placed: home (mask px), radius, height, island
+  const hxAll = new Float32Array(nWant), hyAll = new Float32Array(nWant);
+  const rAll = new Float32Array(nWant), kAll = new Float32Array(nWant), isl = new Int32Array(nWant);
   const tally = new Int32Array(islands);   // instances per island, tallied as they're placed below
   let count = 0;
-  for (let n = 0; n < ui.instances * 4 && count < ui.instances; n++) {   // up to 4 tries per instance
-    const x = Math.floor(Math.random() * mw), y = Math.floor(Math.random() * mh);
+  for (let n = 0; n < nWant * 4 && count < nWant; n++) {   // up to 4 tries per instance
+    const x = Math.floor(THREE.MathUtils.seededRandom() * mw), y = Math.floor(THREE.MathUtils.seededRandom() * mh);
     if (!land(x, y)) continue;
 
     const d = Math.sqrt(dist[y * mw + x]);   // px to the nearest crack
 
     // size: log-normal around full (spread ui.sizeVar, clamped at 2 sigma), capped to the largest
-    // disc whose rim stays 1px clear of the crack. Spots too tight even for SCATTER_MIN_SIZE are skipped
+    // disc whose rim stays 1px clear of the crack. A spot too tight for a full-size dot is skipped, so no dot
+    // shrinks to squeeze in beside a crack
     const cap = 2 * (d - 1);
-    if (cap < full * SCATTER_MIN_SIZE) continue;
-    const gauss = Math.sqrt(-2 * Math.log(1 - Math.random())) * Math.cos(2 * Math.PI * Math.random());   // Box-Muller
+    if (cap < full) continue;
+    const gauss = Math.sqrt(-2 * Math.log(1 - THREE.MathUtils.seededRandom())) * Math.cos(2 * Math.PI * THREE.MathUtils.seededRandom());   // Box-Muller
     const spread = Math.exp(ui.sizeVar * Math.max(-2, Math.min(2, gauss)));
-    const edge = Math.min(1, d / Math.max(1e-6, ui.ramp * mh));   // 0 at a crack, 1 past the scale ramp
-    const taper = ui.minSize + (ui.maxSize - ui.minSize) * edge;   // smaller near the border
-    const size = Math.min(full * spread * taper, cap);
-    if (Math.random() > SCATTER_MIN_DENSITY + (1 - SCATTER_MIN_DENSITY) * Math.min(1, d / R)) continue;   // thin out near cracks
+    const size = Math.min(full * spread, cap);
+    if (THREE.MathUtils.seededRandom() > SCATTER_MIN_DENSITY + (1 - SCATTER_MIN_DENSITY) * Math.min(1, d / R)) continue;   // thin out near cracks
 
-    const lift = Math.random() * edge, z = SCATTER_LIFT + lift * SCATTER_DEPTH;   // lift: 0 lowest, 1 highest; flattens toward the border
-    const k = (DIST - z) / DIST;   // pulls each instance in so it lands on the same screen pixel as
-                                   // the plane point under it (default view), whatever its height
+    // height: a bowl per island, 0 at a crack, easing out to full ui.depth at ui.depthRamp from it (so a big
+    // island's middle is flat); each dot drops a random ui.fill of the way down to the canopy, so 1 fills the dome's volume
+    const t = Math.min(1, d / Math.max(1e-6, ui.depthRamp * upx)), bowl = 1 - (1 - t) ** 2;
+    const lift = bowl * (1 - ui.fill * THREE.MathUtils.seededRandom());   // lift: 0 lowest, 1 highest
+    // z and world xy depend on each other (xy is pulled in by k, which depends on z, which now also
+    // depends on xy via bulgeZ), so two passes settle them, same trick as the tree tips below
+    let z = SCATTER_LIFT + lift * ui.depth;
+    for (let it = 0; it < 2; it++) {
+      const k0 = (CAM_Z - z) / CAM_Z;
+      z = SCATTER_LIFT + lift * ui.depth + bulgeZ(((x + .5) / mw - .5) * h * aspect * k0, ((y + .5) / mh - .5) * h * k0);
+    }
+    const k = (CAM_Z - z) / CAM_Z;   // pulls each instance in so it lands on the same screen pixel as the
+                                      // plane point under it, whatever its height, at CAM_Z (the fixed
+                                      // sizing reference, not necessarily the live "cam z" camera position)
     const s = size / mh * h * k;   // mask px -> world units
     _m.makeScale(s, s, 1).setPosition(((x + .5) / mw - .5) * h * aspect * k, ((y + .5) / mh - .5) * h * k, z);
     scatter.setColorAt(count, _c.copy(islandColor[island[y * mw + x]]).lerp(SCATTER_SHADOW, SCATTER_SHADE * lift));   // higher = more shadow
@@ -387,19 +459,184 @@ function buildScatter(aspect, h) {
     tally[island[y * mw + x]]++;
     scatter.setMatrixAt(count++, _m);
   }
-  // islands too small to carry SCATTER_MIN_ISLAND instances don't exist: drop their dots by
-  // compacting the survivors down over them, reusing what's already on the InstancedMesh
-  let kept = 0;
-  for (let i = 0; i < count; i++) {
-    if (tally[isl[i]] < SCATTER_MIN_ISLAND) continue;
-    if (kept !== i) {
-      scatter.getMatrixAt(i, _m); scatter.setMatrixAt(kept, _m);
-      scatter.getColorAt(i, _c); scatter.setColorAt(kept, _c);
-      hxAll[kept] = hxAll[i]; hyAll[kept] = hyAll[i]; rAll[kept] = rAll[i]; kAll[kept] = kAll[i]; isl[kept] = isl[i];
+  // islands too small to carry SCATTER_MIN_ISLAND instances don't exist: drop their dots. Survivors
+  // are also grouped by island here (a counting sort on isl[i], not just a compaction), so same-island
+  // dots -- linked to each other every frame in stepDots -- sit close together in the flat arrays.
+  // stepDots' links pass turned out to be memory-bound (x[a]/y[a] reads scattered across the whole
+  // range), not compute-bound, so this locality is what actually buys back frame time; skipping
+  // "inactive" links by index instead made it slower (see git history around this comment)
+  if (count) {
+    const off = new Int32Array(islands + 1);
+    for (let i = 0; i < count; i++) if (tally[isl[i]] >= SCATTER_MIN_ISLAND) off[isl[i] + 1]++;
+    for (let a = 0; a < islands; a++) off[a + 1] += off[a];
+    const kept = off[islands];
+    const matSnap = scatter.instanceMatrix.array.slice(0, count * 16), colSnap = scatter.instanceColor.array.slice(0, count * 3);
+    const mArr = scatter.instanceMatrix.array, cArr = scatter.instanceColor.array;
+    const hx2 = new Float32Array(kept), hy2 = new Float32Array(kept), r2 = new Float32Array(kept), k2 = new Float32Array(kept), isl2 = new Int32Array(kept);
+    for (let i = 0; i < count; i++) {
+      const a = isl[i];
+      if (tally[a] < SCATTER_MIN_ISLAND) continue;
+      const d = off[a]++;
+      hx2[d] = hxAll[i]; hy2[d] = hyAll[i]; r2[d] = rAll[i]; k2[d] = kAll[i]; isl2[d] = a;
+      for (let c = 0; c < 16; c++) mArr[d * 16 + c] = matSnap[i * 16 + c];
+      for (let c = 0; c < 3; c++) cArr[d * 3 + c] = colSnap[i * 3 + c];
     }
-    kept++;
+    hxAll.set(hx2); hyAll.set(hy2); rAll.set(r2); kAll.set(k2); isl.set(isl2);
+    count = kept;
   }
-  count = kept;
+
+  // trees, per island that kept its dots: grow() runs a leader from the camera side to the island's center,
+  // and laterals to the other anchors. One tapered mesh per tree. tick() bends each tree along with the canopy
+  trunkGroup.children.forEach((t) => t.geometry.dispose());
+  trunkGroup.clear();
+  const e = scatter.instanceMatrix.array;
+  const ja = THREE.MathUtils.degToRad(ui.jointAngle);
+  // canopy surface: the highest dot covering each cell of a world-space xy grid, read straight off the
+  // placed dots (their world xy already carries the k pull-in, so no mask lookup can get it right).
+  // Cells touching a dot's disc at all count as covered
+  const CZ = .05, gx0 = -h * aspect / 2, gy0 = -h / 2, gw = Math.ceil(h * aspect / CZ), gh = Math.ceil(h / CZ);
+  const rawTop = new Float32Array(gw * gh);
+  for (let i = 0; i < count; i++) {
+    const X = e[i * 16 + 12], Y = e[i * 16 + 13], Z = e[i * 16 + 14], R = e[i * 16] / 2 + CZ * .71;
+    for (let cy = Math.max(0, Math.floor((Y - R - gy0) / CZ)); cy <= Math.min(gh - 1, Math.floor((Y + R - gy0) / CZ)); cy++)
+      for (let cx = Math.max(0, Math.floor((X - R - gx0) / CZ)); cx <= Math.min(gw - 1, Math.floor((X + R - gx0) / CZ)); cx++)
+        if (Math.hypot((cx + .5) * CZ + gx0 - X, (cy + .5) * CZ + gy0 - Y) < R) rawTop[cy * gw + cx] = Math.max(rawTop[cy * gw + cx], Z);
+  }
+  // smooth upper envelope: a max filter then a box blur of the same radius, so every cell stays >= its raw
+  // height (each cell the blur averages is within the dilation radius of it) but the surface the branches
+  // ride no longer jumps from dot to dot, which read as zigzags on thin branches
+  const sweep = (src, horiz, max) => {
+    const out = new Float32Array(src.length), len = horiz ? gw : gh, lines = horiz ? gh : gw;
+    for (let l = 0; l < lines; l++) for (let i = 0; i < len; i++) {
+      let m = 0, s = 0;
+      for (let d = -CANOPY_SMOOTH; d <= CANOPY_SMOOTH; d++) {
+        const j = Math.min(len - 1, Math.max(0, i + d)), v = src[horiz ? l * gw + j : j * gw + l];
+        m = Math.max(m, v); s += v;
+      }
+      out[horiz ? l * gw + i : i * gw + l] = max ? m : s / (2 * CANOPY_SMOOTH + 1);
+    }
+    return out;
+  };
+  const canopyTop = sweep(sweep(sweep(sweep(rawTop, true, true), false, true), true, false), false, false);
+  const canopyZ = (X, Y, r) => {   // highest canopy anywhere under a tube ring of radius r centered at (X, Y)
+    let z = 0;
+    for (let cy = Math.max(0, Math.floor((Y - r - gy0) / CZ)); cy <= Math.min(gh - 1, Math.floor((Y + r - gy0) / CZ)); cy++)
+      for (let cx = Math.max(0, Math.floor((X - r - gx0) / CZ)); cx <= Math.min(gw - 1, Math.floor((X + r - gx0) / CZ)); cx++)
+        z = Math.max(z, canopyTop[cy * gw + cx]);
+    return z;
+  };
+  const tv = [];   // every tree's anchor vertices, in tree order: one tip particle each (tipBody, below)
+  const keptTally = tally.filter((t) => t >= SCATTER_MIN_ISLAND), avgDots = keptTally.length ? keptTally.reduce((s, t) => s + t, 0) / keptTally.length : 1;
+  for (let a = 0; a < islands; a++) {
+    if (tally[a] < SCATTER_MIN_ISLAND || !cnt[a]) continue;
+    // anchors: the island's cut-mesh vertices (verts indices) nearest the points of a Vogel spiral over a disk
+    // BRANCH_REACH of its radius around its centroid; the first point sits on the centroid itself and is the
+    // leader's. ui.tips is the count for an average island, scaled by the island's own dot count
+    const nTips = Math.max(1, Math.round(ui.tips * tally[a] / avgDots));
+    const reach = BRANCH_REACH * Math.sqrt(cnt[a] * cellA / Math.PI), th0 = THREE.MathUtils.seededRandom() * 2 * Math.PI, anchors = [];
+    for (let k = 0; k < nTips; k++) {
+      const rr = reach * Math.sqrt(k / Math.max(1, nTips - 1)), tx = c0x[a] + rr * Math.cos(th0 + k * 2.39996), ty = c0y[a] + rr * Math.sin(th0 + k * 2.39996);
+      let best = -1, bd = Infinity;
+      for (const v of members[a]) { const d = (vhx[v] - tx) ** 2 + (vhy[v] - ty) ** 2; if (d < bd && !anchors.includes(v)) { bd = d; best = v; } }
+      if (best >= 0) anchors.push(best);
+    }
+    const t0 = tv.length;
+    tv.push(...anchors);
+    // each tip sits on the canopy over its anchor's rest spot. A dot at height z is pulled in by
+    // k = (CAM_Z - z) / CAM_Z, so world xy and z depend on each other; two passes settle them.
+    // scl: world units per mask px at that k, x then y, for turning the tip particle's motion into the tip's
+    const scl = new Float64Array(anchors.length * 2);
+    const tips = anchors.map((v, i) => {
+      const X = vhx[v], Y = vhy[v];
+      let z = 0;
+      for (let it = 0; it < 2; it++) { const k = (CAM_Z - z) / CAM_Z; z = canopyZ((X / mw - .5) * h * aspect * k, (Y / mh - .5) * h * k, 0); }
+      const k = (CAM_Z - z) / CAM_Z;
+      scl[i * 2] = h * aspect * k / mw; scl[i * 2 + 1] = h * k / mh;
+      return new THREE.Vector3((X / mw - .5) * h * aspect * k, (Y / mh - .5) * h * k, z);
+    });
+    const K = tips.length, zb = Math.max(...tips.map((p) => p.z)), mid = tips.reduce((s, p) => s.add(p), new THREE.Vector3()).divideScalar(K);
+    const midLen = Math.max(1e-6, Math.hypot(mid.x, mid.y)), baseR = ui.baseR * unit;   // direction of this tree's own crown, out to the shared base circle
+    const pos = [], nrm = [], idx = [], br = [];
+    // one branch serving `set` (indices into tips; set[0] is its own tip) along control points pts, base
+    // first. Its other tips are grouped by direction around its own tip, farthest groups lowest; each
+    // group gets a lateral leaving at the joint angle from a growth point in span (fractions along this
+    // branch), ui.whorls laterals per growth point. A lateral starts inside its parent, no wider than it
+    const grow = (set, pts, parent, jr, span, rMax) => {
+      const smooth = new THREE.CatmullRomCurve3(pts), n = parent < 0 ? 8 : 4;
+      const amp = ui.noise * smooth.getLength() * (parent < 0 ? TRUNK_NOISE_SCALE : 1);
+      const noisy = new THREE.CatmullRomCurve3(Array.from({ length: n + 1 }, (_, j) => {   // noise: n - 1 inner points nudged off the smooth path, across its tangent
+        const p = smooth.getPointAt(j / n);
+        if (j % n) {   // randomDirection(), by hand: seededRandom doesn't back three.js's own RNG
+          const T = smooth.getTangentAt(j / n), rnd = THREE.MathUtils.seededRandom;
+          const theta = rnd() * 2 * Math.PI, u = rnd() * 2 - 1, c = Math.sqrt(1 - u * u);
+          const r = new THREE.Vector3(c * Math.cos(theta), u, c * Math.sin(theta)).multiplyScalar(amp * rnd());
+          p.add(r.projectOnPlane(T));
+        }
+        return p;
+      }));
+      const segs = parent < 0 ? TRUNK_SEGS : BRANCH_SEGS, bi = br.length;
+      const r0 = Math.min(rMax, ui.trunkR * unit * Math.sqrt(set.length / K));   // pipe model
+      // keep the branch in front of the canopy: one point per ring, each pushed toward the camera until its
+      // tube clears the bowl surface under it, tip included (so it sits in front of its dot instead of
+      // piercing it). Ring 0 stays put: a lateral's base has to stay on its parent
+      const radii = Array.from({ length: segs + 1 }, (_, j) => taperAt(r0, j / segs));
+      const ringPts = Array.from({ length: segs + 1 }, (_, j) => noisy.getPointAt(j / segs));
+      // each ring's clearance target, smoothed: a hard per-ring clamp reads as a sideways zigzag under the
+      // perspective camera, since a ring pushed closer to the camera also shifts outward in screen space.
+      // Dilate by 2 rings, then blur with [1 2 1] / 4: every ring's blurred value is still >= its own
+      // requirement (each neighbor's dilated value covers it), so clearance holds and the push ramps in
+      const req = ringPts.map((p, j) => (j ? canopyZ(p.x, p.y, radii[j]) + radii[j] + TIP_CLEARANCE : -Infinity));
+      const wide = req.map((_, j) => Math.max(...req.slice(Math.max(1, j - 2), j + 3)));
+      const curve = new THREE.CatmullRomCurve3(ringPts.map((p, j) => {
+        if (j) {
+          const z = Math.max(p.z, (wide[Math.max(1, j - 1)] + 2 * wide[j] + wide[Math.min(segs, j + 1)]) / 4);
+          // lift along the ring's view ray from the camera's start, not straight along z: a z-only push moves
+          // the ring sideways on screen, and on a branch seen nearly end-on that reads as a hairpin turn
+          if (z > p.z && p.z < START_Z - .1) { const s = (START_Z - z) / (START_Z - p.z); p.x *= s; p.y *= s; }
+          p.z = z;
+        }
+        return p;
+      }));
+      br.push({ v0: pos.length / 3, segs, parent, jr, tip: set[0], ro: new Float64Array((segs + 1) * 3) });   // ro: ring offsets, filled in tick()
+      taperTube(curve, segs, r0, r0 * ui.tipTaper, pos, nrm, idx);
+      const own = tips[set[0]], ang = (k) => Math.atan2(tips[k].y - own.y, tips[k].x - own.x), rest = set.slice(1).sort((p, q) => ang(p) - ang(q));
+      const L = Math.min(rest.length, LAT_MAX), groups = Array.from({ length: L }, (_, g) => rest.slice(Math.round(g * rest.length / L), Math.round((g + 1) * rest.length / L)));
+      const center = (g) => g.reduce((s, k) => s.add(tips[k]), new THREE.Vector3()).divideScalar(g.length);
+      const centers = new Map(groups.map((g) => [g, center(g)]));
+      groups.sort((p, q) => centers.get(q).distanceTo(own) - centers.get(p).distanceTo(own));   // farthest first: lowest on the branch
+      const G = Math.ceil(L / ui.whorls);
+      groups.forEach((g, gi) => {
+        const c = centers.get(g);
+        g.sort((p, q) => tips[p].distanceTo(c) - tips[q].distanceTo(c));   // the lateral's own tip: its group's anchor nearest the group's center
+        const t = span[0] + (span[1] - span[0]) * (G > 1 ? Math.floor(gi / ui.whorls) / (G - 1) : 0);
+        const P = curve.getPointAt(t), T = curve.getTangentAt(t), v = c.clone().sub(P), side = v.clone().projectOnPlane(T).normalize();
+        const d = T.clone().multiplyScalar(Math.cos(ja)).addScaledVector(side, Math.sin(ja)), A = tips[g[0]], len = A.distanceTo(P);
+        // one smooth bend: out along the joint angle, then straight on to the tip (no jittered midpoint, which twisted it)
+        grow(g, [P, P.clone().addScaledVector(d, .3 * len), A.clone()], bi, Math.round(t * segs), [.35, .8], .9 * taperAt(r0, t));
+      });
+    };
+    // the leader: a straight lean from its base near the camera to the center anchor, its lowest lateral at
+    // ui.forkStart plus a random spread along it, its highest just under the canopy. ui.trunkAngle adds extra lean on top of
+    // the shared-circle radius: a real angle from vertical, in the same crown direction, via the base's
+    // height above its own tip (so it composes with baseR instead of replacing it)
+    const lean = baseR + Math.tan(THREE.MathUtils.degToRad(ui.trunkAngle)) * (TRUNK_END_Z - tips[0].z);
+    const base = new THREE.Vector3(mid.x / midLen * lean, mid.y / midLen * lean, TRUNK_END_Z), z2t = (z) => (TRUNK_END_Z - z) / (TRUNK_END_Z - tips[0].z);
+    grow([...tips.keys()], [base, tips[0].clone()], -1, 0, [ui.forkStart + THREE.MathUtils.seededRandom() * TRUNK_FORK_SPREAD, z2t(zb + FORK_TOP_GAP * unit)], Infinity);
+    const g = new THREE.BufferGeometry();
+    g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+    g.setAttribute('normal', new THREE.Float32BufferAttribute(nrm, 3));
+    g.setIndex(idx);
+    const tree = new THREE.Mesh(g, trunkMat);
+    tree.layers.set(1);
+    tree.frustumCulled = false;   // tick() bends it; the build-time bounding sphere goes stale
+    tree.userData = { t0, scl, br, rest: Float32Array.from(pos), off: new Float64Array(K * 3) };   // t0: first tip particle; off: last world offset per anchor
+    trunkGroup.add(tree);
+  }
+  // tip particles: one per anchor, at rest on its vertex. tick() moves each like a dot at that spot (same
+  // spring toward the skinned mesh, same phys) but with no cursor and no links
+  const thx = Float32Array.from(tv, (v) => vhx[v]), thy = Float32Array.from(tv, (v) => vhy[v]);
+  tipBody = { ...makeBody(thx, thy, new Float32Array(tv.length), [], [], [], [], [], mw, mh, upx), tv: Int32Array.from(tv), workHx: new Float32Array(tv.length), workHy: new Float32Array(tv.length) };
+  tipBody.spring = { ...tipBody, hx: tipBody.workHx, hy: tipBody.workHy };   // cached view, same trick as dots.spring
 
   scatter.count = count;
   scatter.instanceMatrix.needsUpdate = true;
@@ -442,10 +679,25 @@ function buildScatter(aspect, h) {
   }
   // no crack walls: the distance field is the crack at rest, and it stops lining up with the land
   // as soon as the mesh bends
+  // per-island sleep bookkeeping for tick(): dots are grouped by island (counting sort above) and links are
+  // listed in dot order, so each island owns one contiguous dot range dS[a]..dS[a+1] and link range
+  // lS[a]..lS[a+1]. bound[a]: how far its dots reach from its rigid center at rest. quiet[a]: frames since
+  // anything there moved. mv[a]: its dots' largest move last step. wob[a]: its satellites' largest wobble.
+  // runs: the awake islands' ranges for this frame, see stepDots
+  const dS = new Int32Array(islands + 1), lS = new Int32Array(islands + 1), bound = new Float32Array(islands);
+  for (let i = 0; i < n; i++) {
+    const a = isl[i];
+    dS[a + 1]++;
+    bound[a] = Math.max(bound[a], Math.hypot(hx[i] - isles.hx[a], hy[i] - isles.hy[a]) + r[i]);
+  }
+  for (let l = 0; l < la.length; l++) lS[isl[la[l]] + 1]++;
+  for (let a = 0; a < islands; a++) { dS[a + 1] += dS[a]; lS[a + 1] += lS[a]; }
   dots = {
-    ...makeBody(hx, hy, r, la, lb, lux, luy, rest, mw, mh),
+    ...makeBody(hx, hy, r, la, lb, lux, luy, rest, mw, mh, upx),
     k: kAll.slice(0, n), isl: isl.slice(0, n),
     h, aspect, rv, rw, workHx: new Float32Array(n), workHy: new Float32Array(n),   // per-dot spring target, refilled each frame in tick()
+    dS, lS, bound, maxR, quiet: new Int32Array(islands), mv: new Float32Array(islands), wob: new Float32Array(islands),
+    runs: new Int32Array(1 + 5 * islands),
   };
   // cached view stepDots reads for the dots pass in tick(): hx/hy swapped for the per-frame spring
   // target. workHx/workHy are mutated in place each frame (never reallocated), so this stays valid
@@ -457,29 +709,36 @@ function buildScatter(aspect, h) {
 // to its home. Links only push apart when two dots get closer than they sat at rest, so the dense,
 // overlapping layout is stable and a push travels through neighbors like colliding balls. The
 // cursor is a solid ball. Runs only while something moves
-let dots = null, isles = null, sats = null, verts = null;   // isles: one rigid center per island; sats: satellites; verts: cut-mesh vertices, skinned (not simulated)
+let dots = null, isles = null, sats = null, verts = null, tipBody = null;   // isles: one rigid center per island; sats: satellites; verts: cut-mesh vertices, skinned (not simulated); tipBody: the trees' tip particles
 let islandGroup = null;   // parent of the per-island meshes cut from the plane
 const LINK_PASSES = 1;   // link passes per substep; 2 made pushes travel stiffer but cost more per frame -- unmeasured at the current SCATTER_N, was ~2ms at 8700 dots
-const phys ={ cursor: .03, push: 1, spring: .01, damping: .99 };   // GUI "physics" folder; cursor = fraction of plane height
-const physIslands = { cursor: IS_TOUCH ? .015 : .06, push: 1, spring: .025, damping: .55 };   // GUI "islands" folder (rigid centers); reach adds the center's own radius on top
-const physSats = { cursor: IS_TOUCH ? .015 : .025, push: 1, spring: .005, damping: .77 };   // GUI "satellites" folder; spring = how firmly a satellite follows its center
+const phys ={ cursor: .05, push: 1, spring: .005, damping: .62 };   // GUI "physics" folder; cursor = fraction of plane height
+const physIslands = { cursor: IS_TOUCH ? .015 : .15, push: 1, spring: .015, damping: .75 };   // GUI "islands" folder (rigid centers); reach adds the center's own radius on top
+const physSats = { cursor: IS_TOUCH ? .015 : .045, push: 1, spring: .005, damping: .54 };   // GUI "satellites" folder; spring = how firmly a satellite follows its center
 
 // one frame: 2 substeps of verlet + spring home and the cursor ball, then LINK_PASSES passes of
 // links. p: phys-shaped params (passed in so the dev self-check can use its own). Returns the
 // largest per-particle move in the last substep, in px, for the sleep test
 function stepDots(s, mx, my, p) {
-  const { n, x, y, px, py, sx0, sy0, hx, hy, r, m, la, lb, ux, uy, rest, mh } = s, cr = p.cursor * mh;
+  const { n, x, y, px, py, sx0, sy0, hx, hy, r, m, la, lb, ux, uy, rest, upx, runs } = s, cr = p.cursor * upx;
+  // runs (the dots only): Int32Array [count, then count x (dot start, dot end, link start, link end, island)],
+  // the awake islands this frame, refilled in place by tick(). Without it the whole body is one run
+  const nr = runs ? runs[0] : 1;
   let moved = 0;
   for (let sub = 0; sub < 2; sub++) {
-    for (let i = 0; i < n; i++) {
-      const vx = (x[i] - px[i]) * p.damping, vy = (y[i] - py[i]) * p.damping;
-      sx0[i] = x[i]; sy0[i] = y[i];   // position before this substep's forces, for the moved measure
-      x[i] += vx + (hx[i] - x[i]) * p.spring;
-      y[i] += vy + (hy[i] - y[i]) * p.spring;
-      const dx = x[i] - mx, dy = y[i] - my, dd = dx * dx + dy * dy, reach = cr + r[i];
-      if (dd < reach * reach) {   // inside the cursor ball: move out toward its surface
-        const d = Math.sqrt(dd) || 1e-6, t = (reach - d) / d * p.push;
-        x[i] += dx * t; y[i] += dy * t;
+    for (let q = 0; q < nr; q++) {
+      const i0 = runs ? runs[1 + q * 5] : 0, i1 = runs ? runs[2 + q * 5] : n;
+      for (let i = i0; i < i1; i++) {
+        sx0[i] = x[i]; sy0[i] = y[i];   // position before this substep's forces, for the moved measure
+        const vx = (x[i] - px[i]) * p.damping, vy = (y[i] - py[i]) * p.damping;
+        px[i] = x[i]; py[i] = y[i];   // next substep's velocity is this substep's move; pushes below shift px with x, so they add none
+        x[i] += vx + (hx[i] - x[i]) * p.spring;
+        y[i] += vy + (hy[i] - y[i]) * p.spring;
+        const dx = x[i] - mx, dy = y[i] - my, dd = dx * dx + dy * dy, reach = cr + r[i];
+        if (dd < reach * reach) {   // inside the cursor ball: move out toward its surface
+          const d = Math.sqrt(dd) || 1e-6, t = (reach - d) / d * p.push, ox = dx * t, oy = dy * t;
+          x[i] += ox; y[i] += oy; px[i] += ox; py[i] += oy;   // px moves with x: a push is a reposition, not an impulse
+        }
       }
     }
     // links push apart along their fixed rest direction u, never along the current a->b line: the
@@ -487,32 +746,41 @@ function stepDots(s, mx, my, p) {
     // and home is the only resting state. Pushing along a->b instead can hold two dots that swapped
     // places in the swapped order against their springs, a permanent jam
     for (let it = 0; it < LINK_PASSES; it++) {
-      for (let l = 0; l < la.length; l++) {
-        const a = la[l], b = lb[l], sep = (x[b] - x[a]) * ux[l] + (y[b] - y[a]) * uy[l];
-        if (sep >= rest[l]) continue;
-        const w = (rest[l] - sep) / (m[a] + m[b]);   // split by mass (r²)
-        x[a] -= ux[l] * w * m[b]; y[a] -= uy[l] * w * m[b];
-        x[b] += ux[l] * w * m[a]; y[b] += uy[l] * w * m[a];
+      for (let q = 0; q < nr; q++) {
+        const l0 = runs ? runs[3 + q * 5] : 0, l1 = runs ? runs[4 + q * 5] : la.length;
+        for (let l = l0; l < l1; l++) {
+          const a = la[l], b = lb[l], sep = (x[b] - x[a]) * ux[l] + (y[b] - y[a]) * uy[l];
+          if (sep >= rest[l]) continue;
+          const w = (rest[l] - sep) / (m[a] + m[b]);   // split by mass (r²)
+          const ax = ux[l] * w * m[b], ay = uy[l] * w * m[b], bx = ux[l] * w * m[a], by = uy[l] * w * m[a];
+          x[a] -= ax; y[a] -= ay; px[a] -= ax; py[a] -= ay;   // px moves with x, as for the cursor push
+          x[b] += bx; y[b] += by; px[b] += bx; py[b] += by;
+        }
       }
     }
-    // px/py capture position after this substep's push AND links settle: next substep's velocity
-    // is (new x - px), so a push's snap is a reposition, not an impulse, and doesn't get carried
-    // forward as momentum. Without this, a particle the cursor shoves hard (e.g. passing almost
-    // exactly over it, d near 0) keeps drifting for several frames after, decaying only by p.damping
-    for (let i = 0; i < n; i++) { px[i] = x[i]; py[i] = y[i]; }
   }
-  for (let i = 0; i < n; i++) moved = Math.max(moved, Math.abs(x[i] - sx0[i]) + Math.abs(y[i] - sy0[i]));
+  for (let q = 0; q < nr; q++) {
+    const i0 = runs ? runs[1 + q * 5] : 0, i1 = runs ? runs[2 + q * 5] : n;
+    let mq = 0;
+    for (let i = i0; i < i1; i++) mq = Math.max(mq, Math.abs(x[i] - sx0[i]) + Math.abs(y[i] - sy0[i]));
+    if (runs) s.mv[runs[5 + q * 5]] = mq;   // per island, for tick()'s sleep test
+    moved = Math.max(moved, mq);
+  }
   return moved;
 }
 
 // write dot positions into the instance matrices' translation (scale never changes),
 // same mapping as placement in buildScatter
 function writeDots(s) {
-  const a = scatter.instanceMatrix.array;
-  for (let i = 0; i < s.n; i++) {
-    a[i * 16 + 12] = (s.x[i] / s.mw - .5) * s.h * s.aspect * s.k[i];
-    a[i * 16 + 13] = (s.y[i] / s.mh - .5) * s.h * s.k[i];
-  }
+  const a = scatter.instanceMatrix.array, { runs } = s, nr = runs[0];   // only the awake islands' dots moved
+  for (let q = 0; q < nr; q++)
+    for (let i = runs[1 + q * 5], i1 = runs[2 + q * 5]; i < i1; i++) {
+      a[i * 16 + 12] = (s.x[i] / s.mw - .5) * s.h * s.aspect * s.k[i];
+      a[i * 16 + 13] = (s.y[i] / s.mh - .5) * s.h * s.k[i];
+    }
+  // the InstancedMesh is sized for the widest aspect (SCATTER_MAX * 3); without an explicit range,
+  // needsUpdate re-uploads that whole oversized buffer every frame instead of just the s.n dots in play
+  scatter.instanceMatrix.addUpdateRange(0, s.n * 16);
   scatter.instanceMatrix.needsUpdate = true;
 }
 
@@ -547,34 +815,87 @@ function tick() {
   const { sIsl, ldx, ldy } = sats;
   for (let j = 0; j < sats.n; j++) { sats.workHx[j] = sats.hx[j] + offX[sIsl[j]]; sats.workHy[j] = sats.hy[j] + offY[sIsl[j]]; }
   moved = Math.max(moved, stepDots(sats.spring, cursor.x, cursor.y, physSats));
-  for (let j = 0; j < sats.n; j++) { ldx[j] = sats.x[j] - sats.workHx[j]; ldy[j] = sats.y[j] - sats.workHy[j]; }
-  // skin the cut mesh: vertex = home + its center's offset + weighted satellite wobble, written
-  // straight into the shared cut-mesh position buffer
-  const { x: vx, y: vy, hx: vhx, hy: vhy, pv, gp, vIsl, vs, vw } = verts;
+  const wob = dots.wob.fill(0);
+  for (let j = 0; j < sats.n; j++) {
+    ldx[j] = sats.x[j] - sats.workHx[j]; ldy[j] = sats.y[j] - sats.workHy[j];
+    wob[sIsl[j]] = Math.max(wob[sIsl[j]], Math.abs(ldx[j]) + Math.abs(ldy[j]));
+  }
+  // skin the cut mesh: vertex = home + its center's offset + weighted satellite wobble. vx/vy feed the
+  // dots' spring target below regardless, but the mesh itself (plane's islandGroup, layer 0) only shows
+  // with "show shader" on -- off by default -- so the write into its position buffer + GPU reupload is
+  // skipped when nothing would see it
+  const { x: vx, y: vy, hx: vhx, hy: vhy, pv, gp, vIsl, vs, vw } = verts, showCracks = camera.layers.isEnabled(0);
   for (let k = 0; k < verts.n; k++) {
     const a = vIsl[k];
     let ox = offX[a], oy = offY[a];
     for (let c = k * 4; c < k * 4 + 4; c++) { const j = vs[c]; if (j >= 0) { ox += vw[c] * ldx[j]; oy += vw[c] * ldy[j]; } }
     vx[k] = vhx[k] + ox; vy[k] = vhy[k] + oy;
-    gp.setXY(pv[k], vx[k] / verts.mw - .5, vy[k] / verts.mh - .5);
+    if (showCracks) gp.setXY(pv[k], vx[k] / verts.mw - .5, vy[k] / verts.mh - .5);
   }
-  gp.needsUpdate = true;
+  if (showCracks) gp.needsUpdate = true;
   // each dot's spring target this frame = its true home plus the mesh displacement under it, so a
   // dent carries its dots along while they keep their own cursor push and links. dots.spring is a
   // cached view onto dots with hx/hy swapped for workHx/workHy (built once in buildScatter);
   // workHx/workHy are refilled below in place, so the cached view stays valid
-  const { rv, rw } = dots;
-  for (let i = 0; i < dots.n; i++) {
-    let ox = 0, oy = 0;
-    for (let c = i * 4; c < i * 4 + 4; c++) {
-      const p = rv[c];
-      if (p >= 0) { ox += rw[c] * (vx[p] - vhx[p]); oy += rw[c] * (vy[p] - vhy[p]); }
+  // Only islands that are awake step: one that has been still for 30 frames, with nothing moving its
+  // center or satellites and the cursor nowhere near, stays put (its dots rest where they are). An island
+  // is near the cursor when the ball reaches its dots' bounding circle around its (moving) center, padded
+  // by its satellites' wobble
+  const { rv, rw, dS, lS, runs, quiet, mv, bound } = dots, reach = phys.cursor * dots.upx + dots.maxR;
+  let nr = 0;
+  for (let a = 0; a < isles.n; a++) {
+    if (dS[a] === dS[a + 1]) continue;
+    const near = Math.hypot(cursor.x - isles.x[a], cursor.y - isles.y[a]) < bound[a] + wob[a] + reach;
+    quiet[a] = near || mv[a] > .02 || Math.abs(offX[a]) + Math.abs(offY[a]) + wob[a] > .02 ? 0 : quiet[a] + 1;
+    if (quiet[a] >= 30) continue;
+    runs.set([dS[a], dS[a + 1], lS[a], lS[a + 1], a], 1 + nr++ * 5);
+  }
+  runs[0] = nr;
+  for (let q = 0; q < nr; q++) {
+    for (let i = runs[1 + q * 5], i1 = runs[2 + q * 5]; i < i1; i++) {
+      let ox = 0, oy = 0;
+      for (let c = i * 4; c < i * 4 + 4; c++) {
+        const p = rv[c];
+        if (p >= 0) { ox += rw[c] * (vx[p] - vhx[p]); oy += rw[c] * (vy[p] - vhy[p]); }
+      }
+      dots.workHx[i] = dots.hx[i] + ox;
+      dots.workHy[i] = dots.hy[i] + oy;
     }
-    dots.workHx[i] = dots.hx[i] + ox;
-    dots.workHy[i] = dots.hy[i] + oy;
   }
   moved = Math.max(moved, stepDots(dots.spring, cursor.x, cursor.y, phys));
   writeDots(dots);
+  // tip particles trail the skinned mesh under their anchor vertex exactly the way a dot there does (same
+  // spring target, same phys), minus the cursor push and links: the trees follow the canopy the dots
+  // show, with the dots' lag, and the cursor never moves them directly
+  const T = tipBody;
+  for (let i = 0; i < T.n; i++) { const v = T.tv[i]; T.workHx[i] = T.hx[i] + vx[v] - vhx[v]; T.workHy[i] = T.hy[i] + vy[v] - vhy[v]; }
+  moved = Math.max(moved, stepDots(T.spring, -1e9, -1e9, phys));
+  // trees bend with their tip particles: each anchor's offset is its particle's move from rest, mask px
+  // scaled to world at the tip's k; z never moves.
+  // Branches go parent-first: a branch's rings run from its parent's ring offset at the joint (0 at the
+  // leader's base near the camera) to its own tip anchor's offset, so joints stay closed. ponytail:
+  // shear, not re-solved curves; rings keep their rest orientation and normals go slightly stale under
+  // big pushes; rebuild the geometry per frame if that shows
+  for (const tree of trunkGroup.children) {
+    const { t0, scl, off, br, rest } = tree.userData;
+    let same = true;
+    for (let k = 0; k < scl.length / 2; k++) {
+      const ox = (T.x[t0 + k] - T.hx[t0 + k]) * scl[k * 2], oy = (T.y[t0 + k] - T.hy[t0 + k]) * scl[k * 2 + 1];
+      same &&= off[k * 3] === ox && off[k * 3 + 1] === oy;
+      off[k * 3] = ox; off[k * 3 + 1] = oy;
+    }
+    if (same) continue;   // anchors didn't move: skip rewriting and re-uploading this tree
+    const p = tree.geometry.attributes.position, arr = p.array;
+    for (const b of br) {
+      const pr = b.parent < 0 ? null : br[b.parent].ro, j3 = b.jr * 3, t3 = b.tip * 3, ro = b.ro;
+      for (let ring = 0, v = b.v0 * 3; ring <= b.segs; ring++) {   // rings of RADIAL + 1 vertices, base first
+        const t = ring / b.segs;
+        for (let c = 0; c < 3; c++) ro[ring * 3 + c] = (pr ? pr[j3 + c] : 0) * (1 - t) + off[t3 + c] * t;
+        for (let j = 0; j <= TRUNK_RADIAL; j++, v += 3) { arr[v] = rest[v] + ro[ring * 3]; arr[v + 1] = rest[v + 1] + ro[ring * 3 + 1]; arr[v + 2] = rest[v + 2] + ro[ring * 3 + 2]; }
+      }
+    }
+    p.needsUpdate = true;
+  }
   render();
   still = moved < .02 ? still + 1 : 0;
   if (still >= 30) { running = false; return; }
@@ -588,40 +909,41 @@ if (!IS_TOUCH) document.body.appendChild(stats.dom);   // touch: GUI hidden exce
 const render = () => { stats.begin(); renderer.render(scene, camera); stats.end(); };
 controls.addEventListener('change', render);
 
-addEventListener('keydown', (e) => {
-  if (e.key !== 'f') return;
-  wireframe.visible = !wireframe.visible;
-  render();
-});
-
 function resize() {
   camera.aspect = innerWidth / innerHeight;
   camera.updateProjectionMatrix();
   renderer.setSize(innerWidth, innerHeight);
   const h = 2 * Math.tan(THREE.MathUtils.degToRad(camera.fov / 2)) * DIST * MARGIN;
-  plane.scale.set(h * camera.aspect, h, 1);
+  // square canopy covering the window (seen from DIST, plus MARGIN) on its long side, times PLANE_SCALE, so
+  // orbiting shows more of it. Touch devices can't orbit, so there the plane just covers the window
+  const aspect = IS_TOUCH ? camera.aspect : 1, ph = IS_TOUCH ? h : h * Math.max(camera.aspect, 1) * PLANE_SCALE;
+  plane.scale.set(ph * aspect, ph, 1);
+  plane.material.uniforms.patternUnit.value = h;
+  plane.material.uniforms.bulgeDepth.value = ui.bulge;
 
-  // rebuild geometry so wireframe cells stay square: segment count on the wider axis scales
-  // with aspect, since the plane's own scale above already stretches non-uniformly
-  const segsX = camera.aspect >= 1 ? Math.round(SEGS * camera.aspect) : SEGS;
-  const segsY = camera.aspect >= 1 ? SEGS : Math.round(SEGS / camera.aspect);
-  plane.geometry.dispose();
-  plane.geometry = new THREE.PlaneGeometry(1, 1, segsX, segsY);
-  wireframe.geometry.dispose();
-  wireframe.geometry = new THREE.WireframeGeometry(plane.geometry);
-
-  buildScatter(camera.aspect, h);   // dots, the island cut meshes, and both physics bodies
+  buildScatter(aspect, ph, h);   // dots, the island cut meshes, trees, and the physics bodies
 
   render();
 }
 // settings panel (top right). Sliders rebuild on release, since a rebuild takes a few hundred ms
 const ui = {
   instances: IS_TOUCH ? 8000 : SCATTER_N,
-  scale: 1.35,
-  minSize: .9,    // taper: size factor at a crack edge
-  maxSize: 1.1,   // and deep inside an island
-  ramp: .06,      // distance from a crack (fraction of plane height) over which size goes from minSize to maxSize
-  sizeVar: SCATTER_SIZE_VAR,
+  scale: 3.5,
+  depth: 1.3,       // world units a dot sits above the canopy at the bottom of its island's bowl
+  depthRamp: .24,   // distance from a crack (fraction of plane height) over which the bowl reaches full depth
+  bulge: 0,         // peak height (world units) of the whole canopy's radial bulge; 0 = flat, matches the shader's bulgeDepth uniform
+  fill: 1,          // 0 = dots only on the dome's surface, 1 = spread through its whole volume down to the canopy
+  sizeVar: 0,       // log-normal size spread; 0 = all one size, .25 = roughly 0.6x to 1.65x the typical size at the 2-sigma clamp
+  tips: 8,          // branch tips for an average-sized island, the leader's included; scaled per island by its own dot count
+  jointAngle: 24,   // degrees a lateral leaves its parent at
+  whorls: 3,        // laterals per growth point
+  noise: .045,      // a branch's inner curve points wander up to this fraction of its length off its smooth path, sideways only; ends stay put
+  forkStart: .44,   // fraction along the leader (0 base, 1 canopy) where its lowest lateral may fork off
+  baseR: .23,       // radius (fraction of plane height) of the shared circle every leader's base sits on
+  trunkAngle: -9,   // degrees of extra lean from vertical, on top of baseR, in the same crown direction
+  trunkR: .019,     // leader base radius, fraction of plane height; a branch serving m of the tree's k tips starts at trunkR * sqrt(m / k) (pipe model)
+  tipTaper: .28,    // every branch tapers to this fraction of its own base radius at its tip
+  wireframe: false,
   shader: false,
   newSeed: () => {
     plane.material.uniforms.seed.value.set(Math.random() * 100, Math.random() * 100);
@@ -634,11 +956,12 @@ const seedUI = gui.addFolder('seed');
 seedUI.add(ui, 'newSeed').name('new seed');   // new layout + next color family
 const dotsUI = gui.addFolder('dots');
 dotsUI.add(ui, 'instances', 0, SCATTER_MAX, 100).onFinishChange(resize);
-dotsUI.add(ui, 'scale', .2, 3, .05).name('dot scale').onFinishChange(resize);
-dotsUI.add(ui, 'minSize', 0, 2, .05).name('min dot scale').onFinishChange(resize);
-dotsUI.add(ui, 'maxSize', 0, 2, .05).name('max dot scale').onFinishChange(resize);
-dotsUI.add(ui, 'ramp', 0, .3, .01).name('scale ramp').onFinishChange(resize);
+dotsUI.add(ui, 'scale').name('dot size').onFinishChange(resize);   // no range: a typed number field, not a slider
 dotsUI.add(ui, 'sizeVar', 0, 1.2, .05).name('size variation').onFinishChange(resize);
+dotsUI.add(ui, 'depth', 0, 1.5, .01).onFinishChange(resize);
+dotsUI.add(ui, 'depthRamp', .01, .6, .01).name('depth ramp').onFinishChange(resize);
+dotsUI.add(ui, 'fill', 0, 1, .01).name('volume fill').onFinishChange(resize);
+dotsUI.add(ui, 'bulge', 0, 3, .05).name('canopy bulge').onFinishChange(resize);
 // shader sliders redraw live while dragging (cheap); dots re-place on release
 const shaderUI = gui.addFolder('shader'), u = plane.material.uniforms;
 shaderUI.add(u.patternScale, 'value', .3, 3, .05).name('shader scale').onChange(render).onFinishChange(resize);
@@ -647,9 +970,33 @@ shaderUI.add(u.zebraAmp, 'value', 0, 1.2, .01).name('warp amp').onChange(render)
 shaderUI.add(u.noiseFreq, 'value', .2, 4, .05).name('warp noise').onChange(render).onFinishChange(resize);
 shaderUI.add(u.widthMin, 'value', 0, 20, .5).name('crack width min').onChange(render).onFinishChange(resize);
 shaderUI.add(u.widthMax, 'value', 1, 20, .5).name('crack width max').onChange(render).onFinishChange(resize);
-// hides the plane from the main camera only: maskCam still sees layer 0, so placement is unaffected
-shaderUI.add(ui, 'shader').name('show shader').onChange((v) => { camera.layers[v ? 'enable' : 'disable'](0); render(); });
+// hides the plane from the main camera only: maskCam still sees layer 0, so placement is unaffected.
+// Turning it on wakes the physics loop instead of rendering directly: tick() skips writing the island
+// meshes' vertex positions while this layer is off (see showCracks below), so a plain render() here could
+// show them still dented from before the shader was hidden, until the next hover refreshes them
+shaderUI.add(ui, 'shader').name('show shader').onChange((v) => { camera.layers[v ? 'enable' : 'disable'](0); v ? wake() : render(); });
 if (!ui.shader) camera.layers.disable(0);   // apply the default; onChange only fires on user changes
+// camera fov: live while dragging, rebuild on release, since resize() sizes the plane (and so dot placement) from it
+const camUI = gui.addFolder('camera');
+camUI.add(camera, 'fov', 10, 120, 1).onChange(() => { camera.updateProjectionMatrix(); render(); }).onFinishChange(resize);
+// pure zoom: doesn't touch canopy sizing (that's DIST, a constant), so no rebuild -- just resync
+// OrbitControls' internal spherical state, which also dispatches 'change' (camera.position differs
+// from what update() last recorded) and renders through the listener below -- no separate render() here
+const camZCtrl = camUI.add(camera.position, 'z', .5, 10, .1).name('cam z').onChange(() => controls.update());
+// keep the slider in sync when the scroll wheel (or a drag, which also changes radius while orbiting) zooms
+controls.addEventListener('change', () => camZCtrl.updateDisplay());
+// every on-screen material; maskMat keeps its own flag, so the placement mask stays solid
+camUI.add(ui, 'wireframe').onChange((v) => { for (const m of [trunkMat, scatterMat, plane.material]) m.wireframe = v; render(); });
+const treesUI = gui.addFolder('trees');   // rebuild on release
+treesUI.add(ui, 'tips', 1, 20, 1).onFinishChange(resize);
+treesUI.add(ui, 'jointAngle', 5, 85, 1).name('joint angle').onFinishChange(resize);
+treesUI.add(ui, 'whorls', 1, 4, 1).onFinishChange(resize);
+treesUI.add(ui, 'noise', 0, .2, .005).onFinishChange(resize);
+treesUI.add(ui, 'forkStart', 0, .8, .01).name('branch height start').onFinishChange(resize);
+treesUI.add(ui, 'baseR', .1, 1.5, .01).name('radius').onFinishChange(resize);
+treesUI.add(ui, 'trunkAngle', -60, 60, 1).name('trunk angle').onFinishChange(resize);
+treesUI.add(ui, 'trunkR', .002, .03, .001).name('trunk base thickness').onFinishChange(resize);
+treesUI.add(ui, 'tipTaper', .02, 1, .01).name('trunk tip thickness').onFinishChange(resize);
 // cursor/push/spring/damping sliders bound to a phys-shaped object, read live every frame
 function physFolder(name, obj) {
   const f = gui.addFolder(name);
@@ -662,11 +1009,14 @@ function physFolder(name, obj) {
 physFolder('physics', phys);
 physFolder('islands', physIslands);   // rigid centers
 physFolder('satellites', physSats);
-if (IS_TOUCH) gui.folders.forEach((f) => f !== seedUI && f.hide());   // touch: only the seed button
+gui.folders.forEach((f) => {   // start collapsed except camera and trees; on touch, hide everything but seed
+  if (f !== camUI && f !== treesUI) f.close();
+  if (IS_TOUCH && f !== seedUI) f.hide();
+});
 
 addEventListener('resize', resize);
 resize();
-if (import.meta.env.DEV) window.dbg = { renderer, scene, camera, scatter, plane, maskMat, phys, physIslands, physSats, cursor, stepDots, get dots() { return dots; }, get isles() { return isles; }, get sats() { return sats; }, get verts() { return verts; }, get running() { return running; } };   // for the checks in CLAUDE.md
+if (import.meta.env.DEV) window.dbg = { renderer, scene, camera, scatter, plane, maskMat, ui, trunks: trunkGroup, phys, physIslands, physSats, cursor, stepDots, get dots() { return dots; }, get isles() { return isles; }, get sats() { return sats; }, get verts() { return verts; }, get tipBody() { return tipBody; }, get running() { return running; } };   // for the checks in CLAUDE.md
 
 if (import.meta.env.DEV) {   // self-check: edt1d against brute force on a random 40x30 grid
   const W = 40, H = 30, g = Float32Array.from({ length: W * H }, () => (Math.random() < .05 ? 0 : 1e20));
